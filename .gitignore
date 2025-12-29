@@ -1,0 +1,92 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+**/.venv/
+**/venv/
+**/env/
+**/ENV/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Application specific
+smart_parking_mvp/logs/
+smart_parking_mvp/output/
+smart_parking_mvp/*.mp4
+smart_parking_mvp/*.avi
+smart_parking_mvp/*.mkv
+smart_parking_mvp/*.mov
+smart_parking_mvp/*.pt
+smart_parking_mvp/*.jpg
+smart_parking_mvp/*.jpeg
+smart_parking_mvp/*.png
+*.pt
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Large YOLO model files
+yolov8*.pt
+yolov5*.pt
+*.weights
+*.onnx
+
+# IDE
+.vscode/
+
+# Node modules
+node_modules/
+**/node_modules/
+
+# Next.js
+.next/
+**/.next/
+out/
+.turbo/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Large binary files
+*.bin
+*.h5
+*.pb
+*.tflite
+
+# Dataset and media
+*.jpg
+*.jpeg
+*.png
+videos/
+datasets/
+data/
+
+# pnpm
+.pnpm-store/
+.pnpm-debug.log*
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo

@@ -1,0 +1,10 @@
+# ByteTrack Configuration for Smart Parking System
+# Optimized for immediate detection and stable tracking
+
+tracker_type: bytetrack      # Use ByteTrack algorithm
+track_high_thresh: 0.1       # Very low = detect all vehicles immediately at start
+track_low_thresh: 0.05       # Second-stage threshold for recovery
+new_track_thresh: 0.4        # Lower = easier to create new tracks (for immediate detection)
+track_buffer: 90             # Keep lost tracks for 90 frames (~6 seconds at 15fps) - balanced
+match_thresh: 0.7            # Higher = more strict matching to prevent ID switches
+fuse_score: True             # Fuse detection score with IoU for stable matching
