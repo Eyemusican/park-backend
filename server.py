@@ -3,7 +3,8 @@ from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import psycopg2
 import os
-from datetime import datetime, timedelta
+import atexit
+from datetime import datetime, timedelta, timezone
 import cv2
 import json
 import threading
@@ -15,6 +16,8 @@ from violation_detector import ViolationDetector, ViolationType, Severity
 from config import YOLO_MODEL
 from rtsp_camera_manager import RTSPCameraManager, CameraConfig, CameraStatus, get_camera_manager
 from detection_manager import get_detection_manager
+from db_helper import ParkingDB
+from telegram_bot import init_telegram_bot, get_telegram_bot
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -106,7 +109,7 @@ def auto_check_violations():
                             violation['severity'],
                             violation['description'],
                             violation['duration_minutes'],
-                            datetime.now(),
+                            datetime.now(timezone.utc),
                             'ACTIVE',
                             parking_name
                         ))
@@ -180,7 +183,7 @@ def get_parking_areas():
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # Get parking areas basic info
+        # Get parking areas basic info including boundary polygon
         cur.execute('''
             SELECT
                 pa.parking_id,
@@ -195,7 +198,8 @@ def get_parking_areas():
                         WHERE pe2.slot_id = ps2.slot_id
                         AND pe2.departure_time IS NULL
                     )
-                ) as occupied_count
+                ) as occupied_count,
+                pa.boundary_polygon
             FROM parking_area pa
             ORDER BY pa.parking_id
         ''')
@@ -211,6 +215,7 @@ def get_parking_areas():
         for area in areas:
             parking_id = area[0]
             total_slots = area[2] or 0
+            boundary_polygon = area[4]  # [[lat, lng], ...]
 
             # Use LIVE data from DetectionManager if detection is running
             if parking_id in detection_manager.detectors and detection_manager.detectors[parking_id].running:
@@ -221,13 +226,23 @@ def get_parking_areas():
                 # Fall back to database count
                 occupied = area[3] or 0
 
+            # Calculate center from boundary polygon
+            center_lat, center_lng = 27.4728, 89.6393  # Default Thimphu
+            if boundary_polygon and len(boundary_polygon) > 0:
+                lats = [p[0] for p in boundary_polygon]
+                lngs = [p[1] for p in boundary_polygon]
+                center_lat = sum(lats) / len(lats)
+                center_lng = sum(lngs) / len(lngs)
+
             result.append({
                 'id': parking_id,
                 'name': area[1],
                 'total_slots': total_slots,
                 'occupied_slots': occupied,
                 'available_slots': total_slots - occupied,
-                'occupancy_rate': (occupied / total_slots * 100) if total_slots > 0 else 0
+                'occupancy_rate': (occupied / total_slots * 100) if total_slots > 0 else 0,
+                'boundary_polygon': boundary_polygon,
+                'center': [center_lat, center_lng]
             })
 
         return jsonify(result), 200
@@ -430,11 +445,10 @@ def get_parking_slots(parking_id):
             detector = detection_manager.detectors[parking_id]
             result = []
             for slot in detector.slots:
-                # Convert Unix timestamp to ISO format string
+                # Convert Unix timestamp to ISO format string (UTC)
                 arrival_time_iso = None
                 if slot.locked_entry_time:
-                    from datetime import datetime
-                    arrival_time_iso = datetime.fromtimestamp(slot.locked_entry_time).isoformat()
+                    arrival_time_iso = datetime.fromtimestamp(slot.locked_entry_time, tz=timezone.utc).isoformat()
 
                 slot_data = {
                     'slot_id': slot.id,
@@ -813,7 +827,7 @@ def create_parking_event():
         # Create event
         cur.execute(
             'INSERT INTO parking_events (slot_id, arrival_time) VALUES (%s, %s) RETURNING event_id',
-            (slot_id, datetime.now())
+            (slot_id, datetime.now(timezone.utc))
         )
         event_id = cur.fetchone()[0]
         
@@ -849,7 +863,7 @@ def record_departure(event_id):
             return jsonify({'error': 'Departure already recorded'}), 400
         
         # Record departure
-        departure_time = datetime.now()
+        departure_time = datetime.now(timezone.utc)
         parked_time = int((departure_time - event[1]).total_seconds() / 60)
         
         cur.execute(
@@ -913,7 +927,7 @@ def parking_entry():
         if entry_time_str:
             entry_time = datetime.fromisoformat(entry_time_str)
         else:
-            entry_time = datetime.now()
+            entry_time = datetime.now(timezone.utc)
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1028,7 +1042,7 @@ def parking_exit():
         if exit_time_str:
             exit_time = datetime.fromisoformat(exit_time_str)
         else:
-            exit_time = datetime.now()
+            exit_time = datetime.now(timezone.utc)
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -1065,7 +1079,10 @@ def parking_exit():
         
         event_id = event[0]
         arrival_time = event[1]
-        
+        # Make naive timestamp timezone-aware (assume UTC)
+        if arrival_time and arrival_time.tzinfo is None:
+            arrival_time = arrival_time.replace(tzinfo=timezone.utc)
+
         # Calculate parking duration in minutes
         if duration:
             parked_minutes = int(duration / 60)
@@ -1252,7 +1269,7 @@ def get_overview_stats():
             'active_events': int(occupied),
             'total_violations': int(active_violations),
             'areas': areas,
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1596,7 +1613,7 @@ def health_check():
         return jsonify({
             'status': 'healthy',
             'database': 'connected',
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }), 200
     except Exception as e:
         return jsonify({
@@ -1667,7 +1684,7 @@ def serve_frame(filename):
 
 @app.route('/api/parking-areas/create-with-slots', methods=['POST'])
 def create_parking_area_with_slots():
-    """Create parking area with slot polygons in one transaction"""
+    """Create parking area with slot polygons and fee configuration in one transaction"""
     data = request.get_json()
 
     # Required fields
@@ -1677,6 +1694,11 @@ def create_parking_area_with_slots():
     video_source = data.get('video_source')
     video_source_type = data.get('video_source_type', 'file')
     reference_frame_path = data.get('reference_frame_path')
+
+    # Fee configuration fields (optional with defaults)
+    hourly_rate = data.get('hourly_rate', 20.00)
+    currency = data.get('currency', 'Nu.')
+    grace_period_minutes = data.get('grace_period_minutes', 15)
 
     if not parking_name:
         return jsonify({'error': 'parking_name is required'}), 400
@@ -1689,14 +1711,16 @@ def create_parking_area_with_slots():
     cur = conn.cursor()
 
     try:
-        # Create parking area with geometry
+        # Create parking area with geometry and fee configuration
         cur.execute('''
             INSERT INTO parking_area
-            (parking_name, slot_count, boundary_polygon, video_source, video_source_type, reference_frame_path)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            (parking_name, slot_count, boundary_polygon, video_source, video_source_type, reference_frame_path,
+             hourly_rate, currency, grace_period_minutes)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING parking_id
         ''', (parking_name, len(slots), json.dumps(boundary_polygon),
-              video_source, video_source_type, reference_frame_path))
+              video_source, video_source_type, reference_frame_path,
+              hourly_rate, currency, grace_period_minutes))
 
         parking_id = cur.fetchone()[0]
 
@@ -1995,7 +2019,7 @@ def check_duration_violations():
                         violation['severity'],
                         violation['description'],
                         violation['duration_minutes'],
-                        datetime.now(),
+                        datetime.now(timezone.utc),
                         'ACTIVE',
                         parking_name
                     ))
@@ -2029,7 +2053,7 @@ def resolve_violation(violation_id):
             SET status = 'RESOLVED', resolved_at = %s
             WHERE violation_id = %s
             RETURNING violation_id
-        ''', (datetime.now(), violation_id))
+        ''', (datetime.now(timezone.utc), violation_id))
         
         result = cur.fetchone()
         conn.commit()
@@ -2077,7 +2101,7 @@ def receive_violation_from_video():
             violation.get('severity'),
             violation.get('description'),
             violation.get('duration_minutes'),
-            datetime.now(),
+            datetime.now(timezone.utc),
             'ACTIVE',
             violation.get('parking_area', 'Video Feed Area')
         ))
@@ -2561,6 +2585,94 @@ def get_camera_stream(camera_id):
                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 
+# ========== Parking Events by Area ==========
+
+@app.route('/api/parking-areas/<int:parking_id>/events', methods=['GET'])
+def get_parking_events_by_area(parking_id):
+    """Get parking events for a specific parking area with screenshots and fees"""
+    limit = request.args.get('limit', 50, type=int)
+    status = request.args.get('status')  # 'active' or 'completed'
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        query = '''
+            SELECT pe.event_id, pe.slot_id, ps.slot_number,
+                   pe.arrival_time, pe.departure_time, pe.fee_amount,
+                   pe.entry_photo_path, pe.exit_photo_path, pe.vehicle_id,
+                   pa.hourly_rate, pa.currency, pa.parking_name
+            FROM parking_events pe
+            JOIN parking_slots ps ON pe.slot_id = ps.slot_id
+            JOIN parking_area pa ON ps.parking_id = pa.parking_id
+            WHERE pa.parking_id = %s
+        '''
+
+        params = [parking_id]
+
+        if status == 'active':
+            query += ' AND pe.departure_time IS NULL'
+        elif status == 'completed':
+            query += ' AND pe.departure_time IS NOT NULL'
+
+        query += ' ORDER BY pe.arrival_time DESC LIMIT %s'
+        params.append(limit)
+
+        cur.execute(query, tuple(params))
+        events = cur.fetchall()
+
+        result = []
+        for e in events:
+            duration_minutes = 0
+            if e[3]:  # arrival_time
+                # Make naive timestamps timezone-aware (assume UTC)
+                arrival_time = e[3].replace(tzinfo=timezone.utc) if e[3].tzinfo is None else e[3]
+                end_time = e[4].replace(tzinfo=timezone.utc) if e[4] and e[4].tzinfo is None else e[4]
+                if not end_time:
+                    end_time = datetime.now(timezone.utc)
+                duration_minutes = (end_time - arrival_time).total_seconds() / 60
+
+            # Extract filename from path for URL
+            entry_photo_url = None
+            exit_photo_url = None
+            if e[6]:  # entry_photo_path
+                entry_photo_url = f"/api/screenshots/{os.path.basename(e[6])}"
+            if e[7]:  # exit_photo_path
+                exit_photo_url = f"/api/screenshots/{os.path.basename(e[7])}"
+
+            result.append({
+                'event_id': e[0],
+                'slot_id': e[1],
+                'slot_number': e[2],
+                'arrival_time': e[3].isoformat() if e[3] else None,
+                'departure_time': e[4].isoformat() if e[4] else None,
+                'fee_amount': float(e[5]) if e[5] else None,
+                'entry_photo_url': entry_photo_url,
+                'exit_photo_url': exit_photo_url,
+                'vehicle_id': e[8],
+                'duration_minutes': int(duration_minutes),
+                'status': 'active' if not e[4] else 'completed',
+                'hourly_rate': float(e[9]) if e[9] else 20.0,
+                'currency': e[10] or 'Nu.',
+                'parking_name': e[11]
+            })
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/screenshots/<path:filename>')
+def serve_screenshot(filename):
+    """Serve captured vehicle screenshots"""
+    screenshot_folder = os.path.join(os.path.dirname(__file__), 'uploads', 'screenshots')
+    return send_from_directory(screenshot_folder, filename)
+
+
 @app.route('/', methods=['GET'])
 def home():
     """API documentation"""
@@ -2628,6 +2740,15 @@ def home():
         }
     }), 200
 
+def cleanup():
+    """Cleanup on shutdown."""
+    bot = get_telegram_bot()
+    if bot:
+        bot.stop()
+
+atexit.register(cleanup)
+
+
 if __name__ == '__main__':
     print("\n🚀 Starting Parking Management API Server...")
     print("📍 Server: http://localhost:5001")
@@ -2639,4 +2760,17 @@ if __name__ == '__main__':
     # Uncomment below to enable manual/database violation checking
     # start_violation_checker()
 
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    # Initialize Telegram bot if token is configured
+    telegram_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    if telegram_token:
+        db = ParkingDB()
+        api_base_url = os.environ.get('TELEGRAM_API_BASE_URL', 'http://localhost:5001/api')
+        bot = init_telegram_bot(telegram_token, db, api_base_url)
+        bot.start()
+        print(" * Telegram bot started")
+    else:
+        print(" * Telegram bot disabled (TELEGRAM_BOT_TOKEN not set)")
+
+    # Disable reloader when bot is enabled to prevent duplicate bot instances
+    use_reloader = not bool(telegram_token)
+    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=use_reloader)

@@ -7,7 +7,7 @@ Tracks vehicle parking duration with high accuracy using:
 - Backend integration for real-time updates
 """
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 import requests
 import json
@@ -49,8 +49,8 @@ class ParkingSession:
         return {
             'vehicle_id': self.vehicle_id,
             'slot_id': self.slot_id,
-            'entry_time': datetime.fromtimestamp(self.entry_time).isoformat(),
-            'exit_time': datetime.fromtimestamp(self.exit_time).isoformat() if self.exit_time else None,
+            'entry_time': datetime.fromtimestamp(self.entry_time, tz=timezone.utc).isoformat(),
+            'exit_time': datetime.fromtimestamp(self.exit_time, tz=timezone.utc).isoformat() if self.exit_time else None,
             'duration': self.get_current_duration(),
             'status': 'PARKED' if self.is_active else 'LEFT'
         }
@@ -281,7 +281,7 @@ class ParkingDurationTracker:
                 'slot_id': session.slot_id,
                 'vehicle_id': session.vehicle_id,
                 'parking_area_id': self.parking_area_id,
-                'entry_time': datetime.fromtimestamp(session.entry_time).isoformat(),
+                'entry_time': datetime.fromtimestamp(session.entry_time, tz=timezone.utc).isoformat(),
                 'status': 'PARKED',
                 'license_plate': session.license_plate,
                 'color': session.color,
@@ -315,7 +315,7 @@ class ParkingDurationTracker:
             payload = {
                 'slot_id': session.slot_id,
                 'vehicle_id': session.vehicle_id,
-                'exit_time': datetime.fromtimestamp(session.exit_time).isoformat(),
+                'exit_time': datetime.fromtimestamp(session.exit_time, tz=timezone.utc).isoformat(),
                 'duration': session.duration,
                 'parking_area_id': self.parking_area_id,
                 'status': 'LEFT'
@@ -345,7 +345,7 @@ class ParkingDurationTracker:
             slot_id: {
                 'slot_id': session.slot_id,
                 'vehicle_id': session.vehicle_id,
-                'entry_time': datetime.fromtimestamp(session.entry_time).isoformat(),
+                'entry_time': datetime.fromtimestamp(session.entry_time, tz=timezone.utc).isoformat(),
                 'duration_seconds': session.get_current_duration(),
                 'duration_minutes': session.get_current_duration() / 60,
                 'status': 'PARKED'

@@ -1,281 +1,230 @@
-# 🚗 Smart Parking System - Phase 2: Vehicle Tracking
+# Smart Parking System - Backend
 
 ## Overview
 
-Advanced YOLO-based vehicle detection and tracking system with **persistent IDs**, **motion detection**, and **real-time performance** (15-20+ FPS).
+Flask-based backend for the Smart Parking System with integrated YOLOv8 vehicle detection, real-time tracking, REST API, and Telegram bot integration.
 
-## ✨ Features
+## Features
 
-### Phase 1 - Vehicle Detection ✅
+### Core Features
+- **Vehicle Detection**: YOLOv8-based detection with ByteTrack tracking
+- **Real-Time Monitoring**: MJPEG streaming of detection feeds
+- **Parking Slot Management**: Define and monitor parking slots via polygon mapping
+- **Violation Detection**: Automatic overtime and unauthorized parking detection
+- **Multi-Camera Support**: RTSP camera integration with auto-reconnect
 
-- ✅ **Multi-Class Detection**: Cars, trucks, buses, motorcycles
-- ✅ **Real-Time Performance**: 15-20+ FPS on standard hardware
-- ✅ **High Accuracy**: 90%+ detection rate with confidence filtering
-- ✅ **GPU Acceleration**: CUDA support for faster processing
+### API Features
+- **REST API**: Full CRUD for parking areas, slots, events, and violations
+- **Live Statistics**: Real-time occupancy rates and analytics
+- **Video Upload**: Upload videos and extract frames for slot mapping
 
-### Phase 2 - Vehicle Tracking ✅ (CURRENT)
+### Telegram Bot
+- **View Parking Areas**: Browse all areas with real-time availability
+- **Live Feed Links**: Get MJPEG stream URLs for each parking area
+- **Availability Notifications**: Subscribe to get notified when spots open up
+- **Commands**: `/start`, `/parking`, `/subscriptions`
 
-- ✅ **Unique Track IDs**: Each vehicle gets persistent ID across frames
-- ✅ **Motion Detection**: Identify moving vs stationary vehicles
-- ✅ **Position History**: Track vehicle paths with visual trails
-- ✅ **Track 20-30+ Vehicles**: Simultaneously track multiple vehicles
-- ✅ **Smart Tracking**: ByteTrack algorithm for robust tracking
-- ✅ **Motion Status**: Real-time moving/stationary classification
-- ✅ **Visual Trails**: See vehicle movement paths
+## Quick Start
 
-## 📋 Requirements
+### Prerequisites
+- Python 3.9+
+- PostgreSQL (via Docker)
+- (Optional) NVIDIA GPU with CUDA
 
-- Python 3.8+
-- Webcam or video file
-- (Optional) NVIDIA GPU with CUDA for better performance
-
-## 🚀 Quick Start
-
-### 1. Install Dependencies
+### Installation
 
 ```bash
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Copy environment file
+cp .env.example .env
+# Edit .env with your database credentials
 ```
 
-### 2. Run Detection & Tracking
-
-**Using webcam with tracking:**
+### Database Setup
 
 ```bash
-python main.py
+# Start PostgreSQL container
+docker run -d \
+    --name parking-postgres \
+    -e POSTGRES_USER=parking_user \
+    -e POSTGRES_PASSWORD=parking_password \
+    -e POSTGRES_DB=parking_db \
+    -p 5433:5432 \
+    postgres:15-alpine
+
+# Apply schema
+docker exec -i parking-postgres psql -U parking_user -d parking_db < parking_schema.sql
+docker exec -i parking-postgres psql -U parking_user -d parking_db < violations_schema.sql
+docker exec -i parking-postgres psql -U parking_user -d parking_db < cameras_schema.sql
+
+# Apply migrations
+docker exec -i parking-postgres psql -U parking_user -d parking_db < migrations/001_add_geometry_columns.sql
+docker exec -i parking-postgres psql -U parking_user -d parking_db < migrations/002_telegram_subscriptions.sql
 ```
 
-**Using video file with tracking:**
+### Run Server
 
 ```bash
-python main.py --video videos/parking_lot.mp4
+source venv/bin/activate
+python server.py
 ```
 
-**Detection only (Phase 1 mode):**
+Server starts at http://localhost:5001
 
-```bash
-python main.py --video parking.mp4 --no-tracking
+## Telegram Bot Setup
+
+1. Create a bot via [@BotFather](https://t.me/BotFather) on Telegram
+2. Get your bot token
+3. Add to `.env`:
+   ```
+   TELEGRAM_BOT_TOKEN=your_token_here
+   ```
+4. Restart the server
+
+See [TELEGRAM_BOT_SETUP.md](TELEGRAM_BOT_SETUP.md) for detailed instructions.
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_HOST` | localhost | Database host |
+| `DB_PORT` | 5432 | Database port |
+| `DB_NAME` | parking_db | Database name |
+| `DB_USER` | parking_user | Database user |
+| `DB_PASS` | - | Database password |
+| `TELEGRAM_BOT_TOKEN` | - | Telegram bot token (optional) |
+| `TELEGRAM_API_BASE_URL` | http://localhost:5001/api | API URL for bot feed links |
+| `FORCE_CPU` | false | Force CPU-only mode (disable GPU) |
+
+### Detection Config (`config.py`)
+
+```python
+YOLO_MODEL = "yolov8s.pt"      # Model: n/s/m/l/x
+CONFIDENCE_THRESHOLD = 0.35    # Detection confidence
+IMAGE_SIZE = 960               # Input resolution
+HALF_PRECISION = True          # FP16 for GPU
 ```
 
-**Using specific camera:**
+## API Endpoints
 
-```bash
-python main.py --source 1
+### Parking Areas
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/parking-areas` | List all parking areas |
+| POST | `/api/parking-areas` | Create parking area |
+| GET | `/api/parking-areas/<id>` | Get parking area |
+| PUT | `/api/parking-areas/<id>` | Update parking area |
+| DELETE | `/api/parking-areas/<id>` | Delete parking area |
+| POST | `/api/parking-areas/create-with-slots` | Create with slot polygons |
+
+### Detection
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/parking-areas/<id>/detection/start` | Start detection |
+| POST | `/api/parking-areas/<id>/detection/stop` | Stop detection |
+| GET | `/api/parking-areas/<id>/detection/status` | Detection status |
+| GET | `/api/parking-areas/<id>/detection/feed` | MJPEG video feed |
+
+### Slots & Events
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/parking-areas/<id>/slots` | Get slots with status |
+| GET | `/api/parking-events` | Get parking events |
+| GET | `/api/parking/active` | Active parking sessions |
+
+### Violations
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/violations` | Get active violations |
+| GET | `/api/violations/summary` | Violation statistics |
+| POST | `/api/violations/resolve/<id>` | Resolve violation |
+
+### Video Upload
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/video/upload` | Upload video, extract frame |
+| GET | `/api/frames/<filename>` | Serve extracted frame |
+
+## Project Structure
+
 ```
-
-### 3. Controls
-
-| Key   | Action               |
-| ----- | -------------------- |
-| `Q`   | Quit application     |
-| `S`   | Save snapshot        |
-| `R`   | Reset statistics     |
-| `T`   | Toggle tracking info |
-| `ESC` | Exit                 |
-
-## 📁 Project Structure
-
-```
-smart_parking_mvp/
-├── main.py              # Main application entry point
-├── detector.py          # VehicleDetector class (YOLO detection & tracking)
-├── tracker.py           # VehicleTracker & TrackingManager (Phase 2)
-├── utils.py             # Visualization utilities
-├── config.py            # Configuration settings
-├── requirements.txt     # Python dependencies
-├── README.md           # This file
+park-backend/
+├── server.py                 # Flask API server (main entry point)
+├── telegram_bot.py           # Telegram bot integration
+├── detection_manager.py      # Detection thread management
+├── detector.py               # YOLOv8 vehicle detector
+├── tracker.py                # Vehicle tracking
+├── db_helper.py              # Database helper class
+├── config.py                 # Configuration settings
+├── violation_detector.py     # Violation detection logic
+├── rtsp_camera_manager.py    # RTSP camera management
+├── requirements.txt          # Python dependencies
+├── .env.example              # Environment template
+├── TELEGRAM_BOT_SETUP.md     # Bot setup guide
 │
-├── videos/             # Input videos folder
-├── output/
-│   └── snapshots/      # Saved snapshots
-├── logs/               # Application logs
-├── configs/            # Configuration files
-└── models/             # YOLO models (auto-downloaded)
+├── migrations/
+│   ├── 001_add_geometry_columns.sql
+│   └── 002_telegram_subscriptions.sql
+│
+├── uploads/
+│   ├── videos/               # Uploaded videos
+│   └── frames/               # Extracted frames
+│
+└── tests/
+    ├── test_api_parking_areas.py
+    └── test_api_parking_slots.py
 ```
 
-## ⚙️ Configuration
-
-Edit [config.py](config.py) to customize:
-
-### YOLO Model Selection
-
-```python
-YOLO_MODEL = "yolov8m.pt"  # Options: yolov8n, yolov8s, yolov8m, yolov8l, yolov8x
-```
-
-### Detection Parameters
-
-```python
-CONFIDENCE_THRESHOLD = 0.35  # Minimum confidence (0-1)
-IOU_THRESHOLD = 0.4          # NMS threshold
-IMAGE_SIZE = 960             # Input resolution
-```
-
-### Tracking Parameters (Phase 2)
-
-```python
-ENABLE_TRACKING = True       # Enable vehicle tracking
-MAX_TRACKED_VEHICLES = 30    # Max simultaneous tracks
-TRACK_HISTORY_LENGTH = 60    # Frames of position history
-MOTION_THRESHOLD = 5.0       # Pixels to consider moving
-```
-
-### Visualization
-
-```python
-SHOW_TRACK_IDS = True        # Display track IDs
-SHOW_MOTION_TRAIL = True     # Show movement trails
-SHOW_MOTION_STATUS = True    # Show moving/stationary status
-SHOW_FPS = True              # Display FPS counter
-```
-
-## 🎯 Performance Targets
-
-| Metric              | Target    | Status       |
-| ------------------- | --------- | ------------ |
-| Detection Accuracy  | 90%+      | ✅ Achieved  |
-| Frame Rate          | 15-20 FPS | ✅ Achieved  |
-| Processing Latency  | <70ms     | ✅ Achieved  |
-| Track Persistence   | 95%+      | ✅ Achieved  |
-| Simultaneous Tracks | 20-30     | ✅ Supported |
-| GPU Support         | Yes       | ✅ Supported |
-
-## 📊 Statistics
-
-The system displays real-time statistics:
-
-### Detection Stats
-
-- **FPS**: Frames processed per second
-- **Process Time**: Time to process each frame (ms)
-- **Detected**: Number of vehicles detected in current frame
-
-### Tracking Stats (Phase 2)
-
-- **Tracked**: Number of active tracked vehicles
-- **Moving**: Vehicles currently in motion
-- **Still**: Stationary vehicles
-- **Total Tracked**: Lifetime total of tracked vehicles
-
-## 🔧 Advanced Usage
-
-### Custom Model
+## Testing
 
 ```bash
-python main.py --model yolov8l.pt
+# Run all tests
+pytest
+
+# Run specific test file
+pytest tests/test_api_parking_areas.py -v
+
+# With coverage
+pytest --cov=. --cov-report=html
 ```
 
-### Custom Confidence Threshold
+## Database Utilities
 
 ```bash
-python main.py --conf 0.5
+# View database contents
+python db_utils.py view
+
+# Live monitoring
+python db_utils.py monitor
+
+# Reset parking data
+python db_utils.py reset
 ```
 
-### Disable Tracking (Phase 1 Mode)
-
-```bash
-python main.py --no-tracking
-```
-
-### Debug Mode
-
-```bash
-python main.py --debug
-```
-
-### Combined Options
-
-```bash
-python main.py --video parking.mp4 --model yolov8l.pt --conf 0.4 --debug
-```
-
-## 🎨 Visualization Features
-
-### Track IDs
-
-- Each vehicle displays unique ID: `ID:7 CAR`
-- IDs persist across frames
-- Lost tracks are cleaned up automatically
-
-### Motion Status
-
-- **Green bounding box**: Moving vehicle
-- **Orange bounding box**: Stationary vehicle
-- Status shown in label: `MOVING` or `STILL`
-
-### Motion Trails
-
-- Magenta trails show vehicle paths
-- Trail fades with age
-- Configurable trail length
-
-### Color Coding
-
-- Cars: Green
-- Trucks: Red
-- Buses: Orange
-- Motorcycles: Magenta
-
-## 📝 Logs
-
-Application logs are saved to:
-
-- `logs/vehicle_detection.log` - Detailed execution log
-- `logs/parking_events.csv` - Detection events (future phases)
-
-## 🖼️ Snapshots
-
-Saved snapshots include:
-
-- All detected vehicles with bounding boxes
-- Statistics overlay
-- Timestamp in filename
-
-Location: `output/snapshots/`
-
-## 🚧 Future Phases
-
-- **Phase 3**: Parking slot definition and management
-- **Phase 4**: Occupancy detection (slot-level tracking)
-- **Phase 5**: Analytics and reporting
-- **Phase 6**: Web dashboard and REST API
-- **Phase 7**: Alerts and notifications
-
-## 🐛 Troubleshooting
-
-### Low FPS / Performance Issues
-
-1. Use a smaller YOLO model: `yolov8n.pt` or `yolov8s.pt`
-2. Reduce image size in config: `IMAGE_SIZE = 640`
-3. Enable frame skipping: `FRAME_SKIP = 2`
-4. Check GPU availability: System will show "Using device: cuda" if GPU is active
+## Troubleshooting
 
 ### Detection Issues
+- Check GPU availability: Look for "Using device: cuda" in logs
+- Reduce `IMAGE_SIZE` to 640 for better performance
+- Use smaller model: `yolov8n.pt` instead of `yolov8s.pt`
 
-1. Adjust confidence threshold: Lower for more detections, higher for fewer false positives
-2. Ensure good lighting in video source
-3. Try different YOLO models for better accuracy
+### Database Connection
+- Verify PostgreSQL container is running: `docker ps`
+- Check connection: `docker exec -it parking-postgres psql -U parking_user -d parking_db`
 
-### Video Source Issues
+### Telegram Bot Not Responding
+- Verify `TELEGRAM_BOT_TOKEN` is set in `.env`
+- Check token: `curl https://api.telegram.org/bot<TOKEN>/getMe`
+- Check server logs for bot startup message
 
-1. Check camera index (usually 0, 1, or 2)
-2. Verify video file path is correct
-3. Ensure camera permissions are granted
+## License
 
-## 📄 License
-
-This project is part of the Smart Parking System MVP.
-
-## 👨‍💻 Development
-
-Built with:
-
-- YOLOv8 (Ultralytics)
-- OpenCV
-- PyTorch
-- NumPy
-
----
-
-**Status**: Phase 2 Complete ✅  
-**Next**: Phase 3 - Parking Slot Definition
+Smart Parking System - AI-powered parking monitoring solution.

@@ -8,12 +8,16 @@ import numpy as np
 import threading
 import time
 import os
-from datetime import datetime
+import math
+from datetime import datetime, timezone
 from shapely.geometry import Polygon, box as shapely_box, Point
 from ultralytics import YOLO
 import torch
 import psycopg2
 import json
+
+# Screenshot storage folder
+SCREENSHOT_FOLDER = 'uploads/screenshots'
 
 # Vehicle class names for display
 VEHICLE_CLASS_NAMES = {
@@ -311,8 +315,67 @@ class ParkingAreaDetector:
         except Exception as e:
             print(f"Error loading slots: {e}")
 
+    def _capture_screenshot(self, slot, event_type):
+        """Capture and save screenshot of vehicle in slot
+
+        Args:
+            slot: ParkingSlot object
+            event_type: 'entry' or 'exit'
+
+        Returns:
+            filepath string or None if capture failed
+        """
+        if self.current_frame is None:
+            return None
+
+        try:
+            # Ensure screenshot folder exists
+            os.makedirs(SCREENSHOT_FOLDER, exist_ok=True)
+
+            # Generate filename with timestamp (UTC for consistency)
+            timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            parking_safe = self.parking_name.replace(' ', '_').replace('/', '-')
+            filename = f"slot_{slot.id}_{event_type}_{timestamp}.jpg"
+            filepath = os.path.join(SCREENSHOT_FOLDER, filename)
+
+            # Get frame dimensions
+            h, w = self.current_frame.shape[:2]
+
+            # Calculate crop region around slot polygon with padding
+            points = np.array(slot.points)
+            x_min, y_min = points.min(axis=0)
+            x_max, y_max = points.max(axis=0)
+
+            # Add padding (50 pixels)
+            padding = 50
+            x_min = max(0, int(x_min) - padding)
+            y_min = max(0, int(y_min) - padding)
+            x_max = min(w, int(x_max) + padding)
+            y_max = min(h, int(y_max) + padding)
+
+            # Crop the frame around the slot
+            cropped = self.current_frame[y_min:y_max, x_min:x_max]
+
+            # Add event info overlay on the crop
+            cv2.putText(cropped, f"{event_type.upper()}", (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(cropped, f"Slot {slot.slot_number}", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+            # Save the cropped image
+            if cv2.imwrite(filepath, cropped):
+                print(f"[{self.parking_name}] Screenshot saved: {filename}")
+                return filepath
+            else:
+                print(f"[{self.parking_name}] Failed to save screenshot")
+                return None
+
+        except Exception as e:
+            print(f"[{self.parking_name}] Error capturing screenshot: {e}")
+            return None
+
     def _update_slot_in_db(self, slot, is_occupied, vehicle_id=None):
-        """Update slot occupancy in database"""
+        """Update slot occupancy in database with screenshot capture and fee calculation"""
         try:
             conn = self._get_db_connection()
             cur = conn.cursor()
@@ -326,18 +389,48 @@ class ParkingAreaDetector:
                 existing = cur.fetchone()
 
                 if not existing:
-                    # Create new parking event
+                    # Capture entry screenshot
+                    entry_photo = self._capture_screenshot(slot, 'entry')
+
+                    # Create new parking event with entry photo
                     cur.execute('''
-                        INSERT INTO parking_events (slot_id, vehicle_id, arrival_time)
-                        VALUES (%s, %s, NOW())
-                    ''', (slot.id, str(vehicle_id)))
+                        INSERT INTO parking_events (slot_id, vehicle_id, arrival_time, entry_photo_path)
+                        VALUES (%s, %s, NOW(), %s)
+                    ''', (slot.id, str(vehicle_id), entry_photo))
             else:
-                # Close any active parking event
+                # Capture exit screenshot before closing event
+                exit_photo = self._capture_screenshot(slot, 'exit')
+
+                # Get parking area fee configuration and calculate duration in database
+                # Using database NOW() for both timestamps ensures no timezone mismatch
+                cur.execute('''
+                    SELECT
+                        pa.hourly_rate,
+                        pa.grace_period_minutes,
+                        EXTRACT(EPOCH FROM (NOW() - pe.arrival_time))/60 as duration_minutes
+                    FROM parking_area pa
+                    JOIN parking_slots ps ON ps.parking_id = pa.parking_id
+                    LEFT JOIN parking_events pe ON pe.slot_id = ps.slot_id AND pe.departure_time IS NULL
+                    WHERE ps.slot_id = %s
+                ''', (slot.id,))
+                rate_row = cur.fetchone()
+
+                hourly_rate = float(rate_row[0]) if rate_row and rate_row[0] else 20.00
+                grace_period = int(rate_row[1]) if rate_row and rate_row[1] else 15
+                duration_minutes = float(rate_row[2]) if rate_row and rate_row[2] else 0
+
+                # Calculate fee based on duration
+                billable_minutes = max(0, duration_minutes - grace_period)
+                fee_amount = math.ceil(billable_minutes / 60) * hourly_rate if billable_minutes > 0 else 0
+
+                # Close parking event with exit photo and fee
                 cur.execute('''
                     UPDATE parking_events
-                    SET departure_time = NOW()
+                    SET departure_time = NOW(),
+                        exit_photo_path = %s,
+                        fee_amount = %s
                     WHERE slot_id = %s AND departure_time IS NULL
-                ''', (slot.id,))
+                ''', (exit_photo, fee_amount, slot.id))
 
             conn.commit()
             cur.close()
@@ -558,6 +651,55 @@ class ParkingAreaDetector:
 
         return vis
 
+    def _do_initial_scan(self, cap):
+        """Scan for pre-existing parked vehicles when detection starts"""
+        print(f"[{self.parking_name}] Scanning for pre-existing vehicles...")
+
+        # Read several frames to get stable detections
+        scan_frames = 5
+        slot_detections = {slot.id: [] for slot in self.slots}
+
+        for i in range(scan_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Store current frame for screenshots
+            with self.frame_lock:
+                self.current_frame = frame.copy()
+
+            # Detect vehicles
+            vehicles = self._detect_vehicles(frame)
+
+            # Check which vehicles overlap which slots
+            for slot in self.slots:
+                best_vehicle = None
+                best_overlap = 0
+                for vehicle in vehicles:
+                    overlap = slot.check_overlap(vehicle['bbox'])
+                    if overlap > self.overlap_threshold and overlap > best_overlap:
+                        best_overlap = overlap
+                        best_vehicle = vehicle
+
+                if best_vehicle:
+                    slot_detections[slot.id].append(best_vehicle)
+
+            time.sleep(0.05)  # Small delay between scans
+
+        # Record vehicles that were detected in most scan frames
+        for slot in self.slots:
+            detections = slot_detections[slot.id]
+            if len(detections) >= 3:  # Present in at least 3 of 5 frames
+                # This slot has a pre-existing vehicle
+                best_vehicle = detections[-1]  # Use last detection
+                slot.lock_vehicle(best_vehicle['id'], best_vehicle['bbox'])
+                slot.vehicle_type = best_vehicle.get('vehicle_type', 'Vehicle')
+                self._update_slot_in_db(slot, True, best_vehicle['id'])
+                print(f"[{self.parking_name}] Slot {slot.slot_number}: PRE-EXISTING vehicle detected (ID:{best_vehicle['id']})")
+
+        # Reset video to beginning after initial scan
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
     def _detection_loop(self):
         """Main detection loop"""
         if not self.video_source:
@@ -572,6 +714,10 @@ class ParkingAreaDetector:
             return
 
         print(f"[Area {self.parking_id}] Detection started: {self.video_source}")
+
+        # Do initial scan for pre-existing vehicles
+        self._do_initial_scan(cap)
+
         frame_count = 0
 
         while self.running:

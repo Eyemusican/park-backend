@@ -1,5 +1,5 @@
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timezone
 import os
 
 class ParkingDB:
@@ -137,7 +137,7 @@ class ParkingDB:
             # Insert new parking event
             cur.execute(
                 'INSERT INTO parking_events (slot_id, arrival_time) VALUES (%s, %s) RETURNING event_id',
-                (slot_id, datetime.now())
+                (slot_id, datetime.now(timezone.utc))
             )
             event_id = cur.fetchone()[0]
             
@@ -180,7 +180,10 @@ class ParkingDB:
                 return None
 
             event_id, arrival_time = result
-            departure_time = datetime.now()
+            departure_time = datetime.now(timezone.utc)
+            # Make naive timestamp timezone-aware (assume UTC)
+            if arrival_time and arrival_time.tzinfo is None:
+                arrival_time = arrival_time.replace(tzinfo=timezone.utc)
 
             # Calculate parked time in minutes
             parked_time = int((departure_time - arrival_time).total_seconds() / 60)
