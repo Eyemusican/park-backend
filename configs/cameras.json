@@ -1,0 +1,92 @@
+{
+  "cameras": [
+    {
+      "camera_id": 1,
+      "name": "Parking Lot A - Main Entrance",
+      "rtsp_url": "rtsp://192.168.1.100:554/stream1",
+      "parking_area_id": 1,
+      "auth": {
+        "username": null,
+        "password": null
+      },
+      "settings": {
+        "buffer_size": 1,
+        "timeout_seconds": 10,
+        "retry_interval_seconds": 5,
+        "max_retries": 3
+      },
+      "slot_mapping_file": "configs/parking_slots.json",
+      "is_active": false,
+      "fallback_video": "../parking_evening_vedio.mp4",
+      "notes": "Example RTSP camera configuration - update rtsp_url with actual camera"
+    },
+    {
+      "camera_id": 2,
+      "name": "Parking Lot B - East Wing",
+      "rtsp_url": "rtsp://192.168.1.101:554/stream1",
+      "parking_area_id": 2,
+      "auth": {
+        "username": null,
+        "password": null
+      },
+      "settings": {
+        "buffer_size": 1,
+        "timeout_seconds": 10,
+        "retry_interval_seconds": 5,
+        "max_retries": 3
+      },
+      "slot_mapping_file": "configs/parking_slots.json",
+      "is_active": false,
+      "fallback_video": "../parking_video.mp4",
+      "notes": "Parking Lot B camera - uses daytime video as fallback"
+    },
+    {
+      "camera_id": 3,
+      "name": "Parking Lot C - West Wing",
+      "rtsp_url": "rtsp://192.168.1.102:554/stream1",
+      "parking_area_id": 3,
+      "auth": {
+        "username": null,
+        "password": null
+      },
+      "settings": {
+        "buffer_size": 1,
+        "timeout_seconds": 10,
+        "retry_interval_seconds": 5,
+        "max_retries": 3
+      },
+      "slot_mapping_file": "configs/parking_slots.json",
+      "is_active": false,
+      "fallback_video": "../test1.mp4",
+      "notes": "Parking Lot C camera - uses test1 video as fallback"
+    }
+  ],
+  "fallback_sources": [
+    {
+      "name": "Demo Video - Evening",
+      "source": "../parking_evening_vedio.mp4",
+      "parking_area_id": 1,
+      "is_default": true
+    },
+    {
+      "name": "Demo Video - Daytime",
+      "source": "../parking_video.mp4",
+      "parking_area_id": 2,
+      "is_default": false
+    },
+    {
+      "name": "Demo Video - Test",
+      "source": "../test1.mp4",
+      "parking_area_id": 3,
+      "is_default": false
+    }
+  ],
+  "global_settings": {
+    "health_check_interval_seconds": 30,
+    "frame_skip_on_lag": 2,
+    "reconnect_on_fps_drop_below": 5,
+    "max_simultaneous_cameras": 3,
+    "prefer_rtsp_over_file": false,
+    "auto_fallback_to_video": true
+  }
+}

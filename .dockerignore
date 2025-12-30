@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+*.pyo
+.env
+.git
+*.mp4
+*.avi
+output/
+logs/
+.pytest_cache/

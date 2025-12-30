@@ -177,7 +177,92 @@ class VehicleTracker:
     def mark_lost(self):
         """Mark tracker as lost (no detection in current frame)"""
         self.lost_frames += 1
-    
+        self.occluded = True
+
+        # Predict position during occlusion using velocity
+        self._update_during_occlusion()
+
+    def _update_during_occlusion(self):
+        """
+        Maintain track with position prediction during occlusion.
+        Uses velocity-based prediction and decaying confidence.
+        """
+        # Predict position based on last known velocity
+        if len(self.positions) >= 2:
+            # Calculate velocity from last two positions
+            prev_pos = self.positions[-2]
+            last_pos = self.positions[-1]
+            velocity_x = last_pos[0] - prev_pos[0]
+            velocity_y = last_pos[1] - prev_pos[1]
+
+            # Predict new position
+            predicted_x = last_pos[0] + velocity_x
+            predicted_y = last_pos[1] + velocity_y
+            predicted_pos = (int(predicted_x), int(predicted_y))
+
+            # Store predicted position (for potential re-identification)
+            self.predicted_position = predicted_pos
+
+            # Predict bounding box shift
+            if len(self.bboxes) >= 1:
+                last_bbox = self.bboxes[-1]
+                predicted_bbox = (
+                    last_bbox[0] + velocity_x,
+                    last_bbox[1] + velocity_y,
+                    last_bbox[2] + velocity_x,
+                    last_bbox[3] + velocity_y
+                )
+                self.predicted_bbox = tuple(int(v) for v in predicted_bbox)
+
+        # Decay confidence gradually during occlusion
+        # This helps with re-identification scoring
+        self.current_confidence *= 0.95
+
+        # Don't let confidence drop below a minimum
+        self.current_confidence = max(self.current_confidence, 0.1)
+
+    def get_predicted_position(self) -> Optional[Tuple[int, int]]:
+        """Get predicted position during occlusion"""
+        if hasattr(self, 'predicted_position') and self.occluded:
+            return self.predicted_position
+        return self.current_position
+
+    def get_predicted_bbox(self) -> Optional[Tuple[int, int, int, int]]:
+        """Get predicted bounding box during occlusion"""
+        if hasattr(self, 'predicted_bbox') and self.occluded:
+            return self.predicted_bbox
+        return self.current_bbox
+
+    def match_by_features(self, vehicle_color: str, vehicle_class: int) -> float:
+        """
+        Calculate match score based on vehicle features for re-identification.
+
+        Args:
+            vehicle_color: Detected vehicle color
+            vehicle_class: COCO class ID
+
+        Returns:
+            float: Match score (0.0 to 1.0)
+        """
+        score = 0.0
+
+        # Class match is important
+        if vehicle_class == self.class_id:
+            score += 0.5
+
+        # Color matching (if we have stored color)
+        if hasattr(self, 'vehicle_color') and self.vehicle_color:
+            if vehicle_color and vehicle_color.lower() == self.vehicle_color.lower():
+                score += 0.3
+
+        # Proximity to predicted position
+        if hasattr(self, 'predicted_position') and self.occluded:
+            # This would need the new detection position to calculate
+            # For now, add base score for having a prediction
+            score += 0.2
+
+        return min(score, 1.0)
+
     def is_lost(self) -> bool:
         """Check if tracker should be removed"""
         return self.lost_frames > config.TRACK_BUFFER

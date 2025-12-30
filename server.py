@@ -1,4 +1,5 @@
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
+from werkzeug.utils import secure_filename
 from flask_cors import CORS
 import psycopg2
 import os
@@ -11,9 +12,22 @@ from ultralytics import YOLO
 import numpy as np
 from shapely.geometry import Polygon
 from violation_detector import ViolationDetector, ViolationType, Severity
+from config import YOLO_MODEL
+from rtsp_camera_manager import RTSPCameraManager, CameraConfig, CameraStatus, get_camera_manager
+from detection_manager import get_detection_manager
+from dotenv import load_dotenv
+load_dotenv()
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for frontend
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Enable CORS for all API routes
+
+# Upload configuration for video files
+UPLOAD_FOLDER = 'uploads/videos'
+FRAME_FOLDER = 'uploads/frames'
+ALLOWED_EXTENSIONS = {'mp4', 'avi', 'mov', 'mkv'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # Global variables for video streaming
 current_frame = None
@@ -122,6 +136,8 @@ def start_violation_checker():
         checker_thread.start()
         print("✅ Automatic violation checker started")
 
+
+
 # Database connection settings
 DB_HOST = os.environ.get('DB_HOST', '127.0.0.1')
 DB_PORT = os.environ.get('DB_PORT', '5432')
@@ -156,59 +172,102 @@ def get_db_connection():
 
 @app.route('/api/parking-areas', methods=['GET'])
 def get_parking_areas():
-    """GET - Get all parking areas with current stats"""
+    """GET - Get all parking areas with current stats
+
+    Uses LIVE detection data when detection is running, otherwise falls back to database.
+    """
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
+
+        # Get parking areas basic info
         cur.execute('''
-            SELECT 
+            SELECT
                 pa.parking_id,
                 pa.parking_name,
                 pa.slot_count,
-                COUNT(CASE WHEN pe.departure_time IS NULL THEN 1 END) as occupied_count
+                (
+                    SELECT COUNT(DISTINCT ps2.slot_id)
+                    FROM parking_slots ps2
+                    WHERE ps2.parking_id = pa.parking_id
+                    AND EXISTS (
+                        SELECT 1 FROM parking_events pe2
+                        WHERE pe2.slot_id = ps2.slot_id
+                        AND pe2.departure_time IS NULL
+                    )
+                ) as occupied_count
             FROM parking_area pa
-            LEFT JOIN parking_slots ps ON pa.parking_id = ps.parking_id
-            LEFT JOIN parking_events pe ON ps.slot_id = pe.slot_id AND pe.departure_time IS NULL
-            GROUP BY pa.parking_id, pa.parking_name, pa.slot_count
             ORDER BY pa.parking_id
         ''')
-        
+
         areas = cur.fetchall()
         cur.close()
         conn.close()
-        
+
+        # Get detection manager to check for live data
+        detection_manager = get_detection_manager()
+
         result = []
         for area in areas:
+            parking_id = area[0]
             total_slots = area[2] or 0
-            occupied = area[3] or 0
+
+            # Use LIVE data from DetectionManager if detection is running
+            if parking_id in detection_manager.detectors and detection_manager.detectors[parking_id].running:
+                detector = detection_manager.detectors[parking_id]
+                occupied = sum(1 for s in detector.slots if s.is_occupied)
+                total_slots = len(detector.slots) if detector.slots else total_slots
+            else:
+                # Fall back to database count
+                occupied = area[3] or 0
+
             result.append({
-                'id': area[0],
+                'id': parking_id,
                 'name': area[1],
                 'total_slots': total_slots,
                 'occupied_slots': occupied,
                 'available_slots': total_slots - occupied,
                 'occupancy_rate': (occupied / total_slots * 100) if total_slots > 0 else 0
             })
-        
+
         return jsonify(result), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/parking-areas/<int:parking_id>', methods=['GET'])
 def get_parking_area(parking_id):
-    """GET - Get specific parking area details"""
+    """GET - Get specific parking area details
+
+    Uses LIVE detection data when detection is running, otherwise falls back to database.
+    """
     try:
+        # Check if detection is running - if so, return LIVE data
+        detection_manager = get_detection_manager()
+        if parking_id in detection_manager.detectors and detection_manager.detectors[parking_id].running:
+            detector = detection_manager.detectors[parking_id]
+            total_slots = len(detector.slots)
+            occupied = sum(1 for s in detector.slots if s.is_occupied)
+            result = {
+                'id': parking_id,
+                'name': detector.parking_name,
+                'total_slots': total_slots,
+                'occupied_slots': occupied,
+                'available_slots': total_slots - occupied,
+                'occupancy_rate': (occupied / total_slots * 100) if total_slots > 0 else 0
+            }
+            return jsonify(result), 200
+
+        # Fall back to database
         conn = get_db_connection()
         cur = conn.cursor()
-        
+
         # Get parking area info
         cur.execute('SELECT parking_id, parking_name, slot_count FROM parking_area WHERE parking_id = %s', (parking_id,))
         area = cur.fetchone()
-        
+
         if not area:
             return jsonify({'error': 'Parking area not found'}), 404
-        
+
         # Get occupied slots count
         cur.execute('''
             SELECT COUNT(*) FROM parking_events pe
@@ -216,10 +275,10 @@ def get_parking_area(parking_id):
             WHERE ps.parking_id = %s AND pe.departure_time IS NULL
         ''', (parking_id,))
         occupied = cur.fetchone()[0]
-        
+
         cur.close()
         conn.close()
-        
+
         total_slots = area[2] or 0
         result = {
             'id': area[0],
@@ -229,7 +288,7 @@ def get_parking_area(parking_id):
             'available_slots': total_slots - occupied,
             'occupancy_rate': (occupied / total_slots * 100) if total_slots > 0 else 0
         }
-        
+
         return jsonify(result), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -359,48 +418,86 @@ def delete_parking_area(parking_id):
 
 @app.route('/api/parking-areas/<int:parking_id>/slots', methods=['GET'])
 def get_parking_slots(parking_id):
-    """GET - Get all slots for a parking area with current status"""
+    """GET - Get all slots for a parking area with current status and accurate duration
+
+    When detection is running, returns LIVE data from DetectionManager (memory).
+    When detection is stopped, falls back to database query.
+    """
     try:
+        # Check if detection is running - if so, return LIVE data from memory
+        detection_manager = get_detection_manager()
+        if parking_id in detection_manager.detectors and detection_manager.detectors[parking_id].running:
+            detector = detection_manager.detectors[parking_id]
+            result = []
+            for slot in detector.slots:
+                # Convert Unix timestamp to ISO format string
+                arrival_time_iso = None
+                if slot.locked_entry_time:
+                    from datetime import datetime
+                    arrival_time_iso = datetime.fromtimestamp(slot.locked_entry_time).isoformat()
+
+                slot_data = {
+                    'slot_id': slot.id,
+                    'slot_number': slot.slot_number,
+                    'is_occupied': slot.is_occupied,
+                    'event_id': None,  # Not applicable for live detection
+                    'arrival_time': arrival_time_iso,
+                    'duration_minutes': int(slot.get_duration() / 60) if slot.is_occupied else None,
+                    'parking_name': detector.parking_name,
+                    'vehicle_id': slot.locked_vehicle_id,
+                }
+                result.append(slot_data)
+            print(f"✅ Returning LIVE slot data for parking {parking_id}: {sum(1 for s in detector.slots if s.is_occupied)}/{len(detector.slots)} occupied")
+            return jsonify(result), 200
+
+        # Detection not running - fall back to database query
         conn = get_db_connection()
         cur = conn.cursor()
-        
+
+        # Get parking area name for reference
+        cur.execute('SELECT parking_name FROM parking_area WHERE parking_id = %s', (parking_id,))
+        area_result = cur.fetchone()
+        parking_name = area_result[0] if area_result else "Unknown Area"
+
         cur.execute('''
-            SELECT 
+            SELECT
                 ps.slot_id,
                 ps.slot_number,
                 pe.event_id,
                 pe.arrival_time,
-                CASE WHEN pe.event_id IS NOT NULL AND pe.departure_time IS NULL THEN true ELSE false END as is_occupied
+                CASE WHEN pe.event_id IS NOT NULL AND pe.departure_time IS NULL THEN true ELSE false END as is_occupied,
+                EXTRACT(EPOCH FROM (NOW() - pe.arrival_time))/60 as duration_minutes
             FROM parking_slots ps
             LEFT JOIN parking_events pe ON ps.slot_id = pe.slot_id AND pe.departure_time IS NULL
             WHERE ps.parking_id = %s
             ORDER BY ps.slot_number
         ''', (parking_id,))
-        
+
         slots = cur.fetchall()
         cur.close()
         conn.close()
-        
+
         result = []
         for slot in slots:
+            is_occupied = slot[4] or False
+            duration_mins = int(slot[5]) if slot[5] else 0
+
             slot_data = {
                 'slot_id': slot[0],
                 'slot_number': slot[1],
-                'is_occupied': slot[4] or False,
+                'is_occupied': is_occupied,
                 'event_id': slot[2],
                 'arrival_time': slot[3].isoformat() if slot[3] else None,
-                'duration_minutes': None
+                'duration_minutes': duration_mins if is_occupied else None,
+                'parking_name': parking_name,
+                'vehicle_id': f"V-{slot[2]}" if slot[2] else None,
             }
-            
-            # Calculate duration if occupied
-            if slot[4] and slot[3]:
-                duration = (datetime.now() - slot[3]).total_seconds() / 60
-                slot_data['duration_minutes'] = int(duration)
-            
+
             result.append(slot_data)
-        
+
         return jsonify(result), 200
     except Exception as e:
+        print(f"❌ Error in get_parking_slots: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/parking-areas/<int:parking_id>/slots', methods=['POST'])
@@ -482,17 +579,140 @@ def delete_parking_slot(slot_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/parking-slots', methods=['GET'])
+def get_all_parking_slots():
+    """GET - Get all parking slots across all areas"""
+    try:
+        parking_id = request.args.get('parking_id', type=int)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        if parking_id:
+            # Get slots for specific parking area
+            cur.execute('''
+                SELECT 
+                    ps.slot_id,
+                    ps.slot_number,
+                    ps.parking_id,
+                    pa.parking_name,
+                    pe.event_id,
+                    pe.arrival_time,
+                    CASE WHEN pe.event_id IS NOT NULL AND pe.departure_time IS NULL THEN true ELSE false END as is_occupied,
+                    EXTRACT(EPOCH FROM (NOW() - pe.arrival_time))/60 as duration_minutes
+                FROM parking_slots ps
+                JOIN parking_area pa ON ps.parking_id = pa.parking_id
+                LEFT JOIN parking_events pe ON ps.slot_id = pe.slot_id AND pe.departure_time IS NULL
+                WHERE ps.parking_id = %s
+                ORDER BY ps.slot_number
+            ''', (parking_id,))
+        else:
+            # Get all slots
+            cur.execute('''
+                SELECT 
+                    ps.slot_id,
+                    ps.slot_number,
+                    ps.parking_id,
+                    pa.parking_name,
+                    pe.event_id,
+                    pe.arrival_time,
+                    CASE WHEN pe.event_id IS NOT NULL AND pe.departure_time IS NULL THEN true ELSE false END as is_occupied,
+                    EXTRACT(EPOCH FROM (NOW() - pe.arrival_time))/60 as duration_minutes
+                FROM parking_slots ps
+                JOIN parking_area pa ON ps.parking_id = pa.parking_id
+                LEFT JOIN parking_events pe ON ps.slot_id = pe.slot_id AND pe.departure_time IS NULL
+                ORDER BY ps.parking_id, ps.slot_number
+            ''')
+        
+        slots = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        result = []
+        for slot in slots:
+            is_occupied = slot[6] or False
+            duration_mins = int(slot[7]) if slot[7] else 0
+            result.append({
+                'slot_id': slot[0],
+                'slot_number': slot[1],
+                'parking_id': slot[2],
+                'parking_name': slot[3],
+                'event_id': slot[4],
+                'status': 'occupied' if is_occupied else 'free',
+                'arrival_time': slot[5].isoformat() if slot[5] else None,
+                'duration_minutes': duration_mins
+            })
+        
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/parking/slots/status', methods=['GET'])
+def get_parking_slots_status():
+    """GET - Get real-time status of all parking slots for live view"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        cur.execute('''
+            SELECT 
+                ps.slot_id,
+                ps.slot_number,
+                pa.parking_name,
+                pe.event_id,
+                pe.arrival_time,
+                CASE WHEN pe.event_id IS NOT NULL AND pe.departure_time IS NULL THEN 'occupied' ELSE 'free' END as status,
+                EXTRACT(EPOCH FROM (NOW() - pe.arrival_time)) as duration_seconds
+            FROM parking_slots ps
+            JOIN parking_area pa ON ps.parking_id = pa.parking_id
+            LEFT JOIN parking_events pe ON ps.slot_id = pe.slot_id AND pe.departure_time IS NULL
+            ORDER BY pa.parking_id, ps.slot_number
+        ''')
+        
+        slots = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        result = []
+        for slot in slots:
+            duration_seconds = int(slot[6]) if slot[6] else 0
+            duration_minutes = duration_seconds // 60
+            
+            slot_number = slot[1]
+            slot_id_str = f"{slot[2]}-{slot_number:03d}"
+            
+            # Get vehicle details from active sessions (in-memory)
+            session = active_parking_sessions.get(str(slot_number))
+            
+            slot_data = {
+                'slot_id': slot_id_str,
+                'vehicle_id': slot[3],
+                'status': slot[5],
+                'entry_time': slot[4].isoformat() if slot[4] else None,
+                'duration_seconds': duration_seconds,
+                'duration_minutes': duration_minutes,
+                # Add vehicle details
+                'license_plate': session.get('license_plate', 'N/A') if session else 'N/A',
+                'color': session.get('color', 'unknown') if session else 'unknown',
+                'vehicle_type': session.get('vehicle_type', 'car') if session else 'car'
+            }
+            result.append(slot_data)
+        
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ============================================================================
 # PARKING EVENTS ENDPOINTS - CRUD
 # ============================================================================
 
 @app.route('/api/parking-events', methods=['GET'])
 def get_parking_events():
-    """GET - Get parking events with filters"""
+    """GET - Get parking events with filters and accurate duration calculation"""
     try:
         limit = request.args.get('limit', 100, type=int)
         parking_id = request.args.get('parking_id', type=int)
         status = request.args.get('status')  # 'occupied' or 'departed'
+        active = request.args.get('active', 'false').lower() == 'true'
         
         conn = get_db_connection()
         cur = conn.cursor()
@@ -500,12 +720,19 @@ def get_parking_events():
         query = '''
             SELECT 
                 pe.event_id,
+                ps.slot_id,
                 ps.slot_number,
                 pa.parking_name,
                 pa.parking_id,
                 pe.arrival_time,
                 pe.departure_time,
-                pe.parked_time
+                pe.parked_time,
+                EXTRACT(EPOCH FROM (
+                    CASE 
+                        WHEN pe.departure_time IS NULL THEN NOW() - pe.arrival_time
+                        ELSE pe.departure_time - pe.arrival_time
+                    END
+                ))/60 as current_duration_minutes
             FROM parking_events pe
             JOIN parking_slots ps ON pe.slot_id = ps.slot_id
             JOIN parking_area pa ON ps.parking_id = pa.parking_id
@@ -518,7 +745,7 @@ def get_parking_events():
             query += ' AND pa.parking_id = %s'
             params.append(parking_id)
         
-        if status == 'occupied':
+        if status == 'occupied' or active:
             query += ' AND pe.departure_time IS NULL'
         elif status == 'departed':
             query += ' AND pe.departure_time IS NOT NULL'
@@ -533,26 +760,28 @@ def get_parking_events():
         
         result = []
         for event in events:
+            is_active = event[6] is None  # No departure time means active
+            
             event_data = {
                 'event_id': event[0],
-                'slot_number': event[1],
-                'parking_name': event[2],
-                'parking_id': event[3],
-                'arrival_time': event[4].isoformat(),
-                'departure_time': event[5].isoformat() if event[5] else None,
-                'parked_time_minutes': event[6],
-                'status': 'departed' if event[5] else 'occupied'
+                'slot_id': event[1],
+                'slot_number': event[2],
+                'parking_name': event[3],
+                'parking_id': event[4],
+                'arrival_time': event[5].isoformat() if event[5] else None,
+                'departure_time': event[6].isoformat() if event[6] else None,
+                'parked_time_minutes': event[7],
+                'duration_minutes': int(event[8]) if event[8] else 0,
+                'status': 'occupied' if is_active else 'departed',
+                'vehicle_id': f"V-{event[0]}",
+                'license_plate': f"LP-{event[0]:04d}",
             }
-            
-            # Calculate current duration if still occupied
-            if not event[5]:
-                duration = (datetime.now() - event[4]).total_seconds() / 60
-                event_data['current_duration_minutes'] = int(duration)
             
             result.append(event_data)
         
         return jsonify(result), 200
     except Exception as e:
+        print(f"❌ Error in get_parking_events: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/parking-events', methods=['POST'])
@@ -666,12 +895,15 @@ def delete_parking_event(event_id):
 
 @app.route('/api/parking/entry', methods=['POST'])
 def parking_entry():
-    """Record vehicle entry into a parking slot (in-memory)"""
+    """Record vehicle entry into a parking slot - saves to database"""
     data = request.get_json()
     
     slot_id = data.get('slot_id')
     vehicle_id = data.get('vehicle_id')
     entry_time_str = data.get('entry_time')
+    license_plate = data.get('license_plate')
+    color = data.get('color')
+    vehicle_type = data.get('vehicle_type')
     
     if not slot_id or vehicle_id is None:
         return jsonify({'error': 'slot_id and vehicle_id are required'}), 400
@@ -683,25 +915,98 @@ def parking_entry():
         else:
             entry_time = datetime.now()
         
-        # Store in memory
-        active_parking_sessions[slot_id] = {
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Convert slot_id from video (slot number 1-8) to database slot_id
+        # The video sends slot_number, we need to look up the actual slot_id
+        slot_number = int(slot_id)
+        
+        # Get the actual database slot_id for this slot_number
+        cur.execute(
+            '''SELECT slot_id FROM parking_slots 
+               WHERE slot_number = %s 
+               LIMIT 1''',
+            (slot_number,)
+        )
+        result = cur.fetchone()
+        if not result:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Slot number {slot_number} not found'}), 404
+        
+        db_slot_id = result[0]
+        
+        # Check if there's already an active event for this slot
+        cur.execute(
+            '''SELECT event_id FROM parking_events 
+               WHERE slot_id = %s AND departure_time IS NULL''',
+            (db_slot_id,)
+        )
+        existing_event = cur.fetchone()
+        
+        if existing_event:
+            # Update existing event (vehicle re-entry or ID change)
+            cur.execute(
+                '''UPDATE parking_events 
+                   SET arrival_time = %s 
+                   WHERE event_id = %s''',
+                (entry_time, existing_event[0])
+            )
+            event_id = existing_event[0]
+            print(f"✅ Entry updated: Slot {slot_id}, Vehicle {vehicle_id} (Event ID: {event_id})")
+        else:
+            # Create new parking event
+            cur.execute(
+                '''INSERT INTO parking_events (slot_id, arrival_time, departure_time, parked_time)
+                   VALUES (%s, %s, NULL, NULL)
+                   RETURNING event_id''',
+                (db_slot_id, entry_time)
+            )
+            event_id = cur.fetchone()[0]
+            print(f"✅ Entry recorded: Slot {slot_id}, Vehicle {vehicle_id} (Event ID: {event_id})")
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        # Also store in memory for quick access with vehicle details
+        # Store with both the slot_id string and the slot_number for lookup flexibility
+        session_data = {
             'vehicle_id': vehicle_id,
             'slot_id': slot_id,
+            'slot_number': slot_number,
             'entry_time': entry_time.isoformat(),
-            'status': 'PARKED'
+            'status': 'PARKED',
+            'event_id': event_id,
+            'license_plate': license_plate or 'N/A',
+            'color': color or 'unknown',
+            'vehicle_type': vehicle_type or 'car'
         }
         
-        print(f"✅ Entry recorded: Slot {slot_id}, Vehicle {vehicle_id}")
+        # Store with both string slot_id and integer slot_number as keys
+        active_parking_sessions[str(slot_id)] = session_data
+        active_parking_sessions[str(slot_number)] = session_data
+        
+        vehicle_info = f" {vehicle_type or 'car'} | {color or 'unknown'} | {license_plate or 'N/A'}"
+        print(f"  Vehicle Details:{vehicle_info}")
+        print(f"  Stored in active_parking_sessions['{slot_id}'] and ['{slot_number}']")
         
         return jsonify({
             'message': 'Parking entry recorded',
+            'event_id': event_id,
             'slot_id': slot_id,
             'vehicle_id': vehicle_id,
-            'entry_time': entry_time.isoformat()
+            'entry_time': entry_time.isoformat(),
+            'license_plate': license_plate,
+            'color': color,
+            'vehicle_type': vehicle_type
         }), 201
         
     except Exception as e:
         print(f"Error in parking_entry: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 
@@ -728,28 +1033,23 @@ def parking_exit():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Parse slot_id to get db_slot_id (same logic as entry)
-        try:
-            if '-' in str(slot_id):
-                parts = str(slot_id).split('-')
-                parking_area_id = parts[0]
-                slot_number = int(parts[1])
-                
-                cur.execute(
-                    '''SELECT ps.slot_id FROM parking_slots ps
-                       JOIN parking_area pa ON ps.parking_id = pa.parking_id
-                       WHERE pa.parking_name LIKE %s AND ps.slot_number = %s''',
-                    (f'%{parking_area_id}%', slot_number)
-                )
-                result = cur.fetchone()
-                if result:
-                    db_slot_id = result[0]
-                else:
-                    db_slot_id = 1
-            else:
-                db_slot_id = int(slot_id)
-        except:
-            db_slot_id = 1
+        # Convert slot_id from video (slot number 1-8) to database slot_id
+        slot_number = int(slot_id)
+        
+        # Get the actual database slot_id for this slot_number
+        cur.execute(
+            '''SELECT slot_id FROM parking_slots 
+               WHERE slot_number = %s 
+               LIMIT 1''',
+            (slot_number,)
+        )
+        result = cur.fetchone()
+        if not result:
+            cur.close()
+            conn.close()
+            return jsonify({'error': f'Slot number {slot_number} not found'}), 404
+        
+        db_slot_id = result[0]
         
         # Find the active parking event for this slot
         cur.execute(
@@ -781,6 +1081,12 @@ def parking_exit():
         conn.commit()
         cur.close()
         conn.close()
+        
+        # Remove from active sessions
+        if str(slot_id) in active_parking_sessions:
+            del active_parking_sessions[str(slot_id)]
+        
+        print(f"✅ Exit recorded: Slot {slot_id}, Vehicle {vehicle_id}, Duration: {parked_minutes}min")
         
         return jsonify({
             'message': 'Parking exit recorded',
@@ -839,15 +1145,26 @@ def get_active_parking():
         result = []
         for row in active:
             duration_seconds = row[4] or 0
+            slot_number = row[1]
+            
+            # Get vehicle details from in-memory sessions
+            # Try both string formats
+            session = active_parking_sessions.get(str(slot_number))
+            
             result.append({
                 'event_id': row[0],
-                'slot_id': f"{row[2]}-{row[1]:03d}",
+                'vehicle_id': row[0],  # Use event_id as vehicle_id
+                'slot_id': f"{row[2]}-{slot_number:03d}",
                 'parking_area': row[2],
-                'slot_number': row[1],
+                'slot_number': slot_number,
                 'entry_time': row[3].isoformat(),
                 'duration_seconds': int(duration_seconds),
                 'duration_minutes': int(duration_seconds / 60),
-                'status': 'PARKED'
+                'status': 'PARKED',
+                # Add vehicle details from session
+                'license_plate': session.get('license_plate', 'N/A') if session else 'N/A',
+                'vehicle_type': session.get('vehicle_type', 'unknown') if session else 'unknown',
+                'color': session.get('color', 'unknown') if session else 'unknown'
             })
         
         return jsonify(result), 200
@@ -861,116 +1178,81 @@ def get_active_parking():
         return jsonify([]), 200
 
 
-@app.route('/api/parking/slots/status', methods=['GET'])
-def get_all_slots_status():
-    """Get status of all parking slots (occupied/free) for live view"""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Get all slots with their current occupancy status
-        cur.execute('''
-            SELECT 
-                ps.slot_id,
-                ps.slot_number,
-                pa.parking_name,
-                pe.event_id,
-                pe.arrival_time,
-                CASE WHEN pe.event_id IS NOT NULL AND pe.departure_time IS NULL THEN 'occupied' ELSE 'free' END as status,
-                EXTRACT(EPOCH FROM (NOW() - pe.arrival_time)) as duration_seconds
-            FROM parking_slots ps
-            JOIN parking_area pa ON ps.parking_id = pa.parking_id
-            LEFT JOIN parking_events pe ON ps.slot_id = pe.slot_id AND pe.departure_time IS NULL
-            ORDER BY ps.slot_number
-        ''')
-        
-        slots = cur.fetchall()
-        cur.close()
-        conn.close()
-        
-        result = []
-        for slot in slots:
-            slot_data = {
-                'slot_id': str(slot[1]),  # slot_number as string
-                'vehicle_id': slot[3] if slot[5] == 'occupied' else None,
-                'status': slot[5],
-                'entry_time': slot[4].isoformat() if slot[4] else None,
-                'duration_seconds': int(slot[6]) if slot[6] else 0,
-                'duration_minutes': int(slot[6] / 60) if slot[6] else 0,
-                'parking_area': slot[2]
-            }
-            result.append(slot_data)
-        
-        return jsonify(result), 200
-    except psycopg2.OperationalError as e:
-        print(f"❌ Database connection error: {e}")
-        return jsonify([]), 200
-    except Exception as e:
-        print(f"❌ Error in get_all_slots_status: {e}")
-        return jsonify([]), 200
-
-
 # ============================================================================
 # STATISTICS ENDPOINTS
 # ============================================================================
 
 @app.route('/api/stats/overview', methods=['GET'])
 def get_overview_stats():
-    """GET - Overall system statistics"""
+    """GET - Overall system statistics with accurate real-time data"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
         # Total parking areas
         cur.execute('SELECT COUNT(*) FROM parking_area')
-        total_areas = cur.fetchone()[0]
+        total_areas = cur.fetchone()[0] or 0
         
         # Total slots
-        cur.execute('SELECT SUM(slot_count) FROM parking_area')
+        cur.execute('SELECT COALESCE(SUM(slot_count), 0) FROM parking_area')
         total_slots = cur.fetchone()[0] or 0
         
-        # Currently occupied
+        # Currently occupied (with NULL check)
         cur.execute('SELECT COUNT(*) FROM parking_events WHERE departure_time IS NULL')
-        occupied = cur.fetchone()[0]
+        occupied = cur.fetchone()[0] or 0
         
-        # Total events today
-        cur.execute('''
-            SELECT COUNT(*) FROM parking_events 
-            WHERE DATE(arrival_time) = CURRENT_DATE
-        ''')
-        events_today = cur.fetchone()[0]
+        # Active violations
+        cur.execute("SELECT COUNT(*) FROM parking_violations WHERE status = 'ACTIVE'")
+        active_violations = cur.fetchone()[0] or 0
         
-        # Average parking duration (today, completed events)
+        # Get areas with detailed stats and accurate calculations
         cur.execute('''
-            SELECT AVG(parked_time) FROM parking_events 
-            WHERE parked_time IS NOT NULL AND DATE(arrival_time) = CURRENT_DATE
+            SELECT 
+                pa.parking_id as id,
+                pa.parking_name as name,
+                COALESCE(pa.slot_count, 0) as total_slots,
+                COALESCE(COUNT(CASE WHEN pe.departure_time IS NULL THEN 1 END), 0) as occupied_slots,
+                COALESCE(pa.slot_count, 0) - COALESCE(COUNT(CASE WHEN pe.departure_time IS NULL THEN 1 END), 0) as available_slots,
+                CASE 
+                    WHEN COALESCE(pa.slot_count, 0) > 0 THEN 
+                        (COALESCE(COUNT(CASE WHEN pe.departure_time IS NULL THEN 1 END), 0)::float / pa.slot_count * 100)
+                    ELSE 0 
+                END as occupancy_rate
+            FROM parking_area pa
+            LEFT JOIN parking_slots ps ON pa.parking_id = ps.parking_id
+            LEFT JOIN parking_events pe ON ps.slot_id = pe.slot_id AND pe.departure_time IS NULL
+            GROUP BY pa.parking_id, pa.parking_name, pa.slot_count
+            ORDER BY pa.parking_id
         ''')
-        avg_duration = cur.fetchone()[0] or 0
-        
-        # Peak hour today
-        cur.execute('''
-            SELECT EXTRACT(HOUR FROM arrival_time) as hour, COUNT(*) as count
-            FROM parking_events
-            WHERE DATE(arrival_time) = CURRENT_DATE
-            GROUP BY hour
-            ORDER BY count DESC
-            LIMIT 1
-        ''')
-        peak_result = cur.fetchone()
-        peak_hour = int(peak_result[0]) if peak_result else None
+        areas_data = cur.fetchall()
+        areas = [
+            {
+                'id': int(row[0]),
+                'name': str(row[1]),
+                'total_slots': int(row[2]),
+                'occupied_slots': int(row[3]),
+                'available_slots': int(row[4]),
+                'occupancy_rate': round(float(row[5]), 2)
+            }
+            for row in areas_data
+        ]
         
         cur.close()
         conn.close()
         
+        # Calculate overall occupancy rate safely
+        overall_occupancy = (occupied / total_slots * 100) if total_slots > 0 else 0
+        
         return jsonify({
-            'total_areas': total_areas,
-            'total_slots': total_slots,
-            'occupied_slots': occupied,
-            'available_slots': total_slots - occupied,
-            'occupancy_rate': (occupied / total_slots * 100) if total_slots > 0 else 0,
-            'events_today': events_today,
-            'avg_duration_minutes': int(avg_duration),
-            'peak_hour': peak_hour
+            'total_areas': int(total_areas),
+            'total_slots': int(total_slots),
+            'total_occupied': int(occupied),
+            'total_available': int(total_slots - occupied),
+            'overall_occupancy_rate': round(overall_occupancy, 2),
+            'active_events': int(occupied),
+            'total_violations': int(active_violations),
+            'areas': areas,
+            'timestamp': datetime.now().isoformat(),
         }), 200
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1022,13 +1304,13 @@ def initialize_model():
     """Initialize YOLO model for video processing"""
     global model
     if model is None:
-        model_path = 'yolov8m.pt'
+        model_path = YOLO_MODEL
         if os.path.exists(model_path):
             model = YOLO(model_path)
-            print(f"✅ YOLO model loaded: {model_path}")
+            print(f"YOLO model loaded: {model_path}")
         else:
-            print("⚠️  YOLO model not found, using default model")
-            model = YOLO('yolov8n.pt')
+            print(f"YOLO model {model_path} not found, downloading...")
+            model = YOLO(model_path)  # Ultralytics will auto-download
 
 def get_slot_occupancy(parking_id):
     """Get current slot occupancy from database"""
@@ -1179,6 +1461,13 @@ def video_feed():
     return Response(generate_frames(),
                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
+# Add alternate route for compatibility
+@app.route('/video_feed')
+def video_feed_alt():
+    """Video streaming endpoint (alternate route)"""
+    return Response(generate_frames(),
+                   mimetype='multipart/x-mixed-replace; boundary=frame')
+
 @app.route('/api/video/start', methods=['POST'])
 def start_video():
     """Start video stream"""
@@ -1222,6 +1511,76 @@ def video_status():
     }), 200
 
 # ============================================================================
+# DETECTION MANAGEMENT (Integrated Detection)
+# ============================================================================
+
+@app.route('/api/parking-areas/<int:parking_id>/detection/start', methods=['POST'])
+def start_detection(parking_id):
+    """Start detection for a parking area"""
+    detection_manager = get_detection_manager()
+    result = detection_manager.start_detection(parking_id)
+
+    if result.get('status') == 'started':
+        return jsonify(result), 200
+    elif result.get('status') == 'already_running':
+        return jsonify(result), 200
+    else:
+        return jsonify(result), 400
+
+@app.route('/api/parking-areas/<int:parking_id>/detection/stop', methods=['POST'])
+def stop_detection(parking_id):
+    """Stop detection for a parking area"""
+    detection_manager = get_detection_manager()
+    result = detection_manager.stop_detection(parking_id)
+
+    if result.get('status') == 'stopped':
+        return jsonify(result), 200
+    else:
+        return jsonify(result), 404
+
+@app.route('/api/parking-areas/<int:parking_id>/detection/status', methods=['GET'])
+def detection_status(parking_id):
+    """Get detection status for a parking area"""
+    detection_manager = get_detection_manager()
+    result = detection_manager.get_status(parking_id)
+
+    if result.get('status') == 'not_found':
+        return jsonify({'running': False, 'parking_id': parking_id}), 200
+    return jsonify(result), 200
+
+@app.route('/api/detection/status', methods=['GET'])
+def all_detection_status():
+    """Get detection status for all parking areas"""
+    detection_manager = get_detection_manager()
+    result = detection_manager.get_status()
+    return jsonify(result), 200
+
+@app.route('/api/parking-areas/<int:parking_id>/detection/feed')
+def detection_feed(parking_id):
+    """Video feed for a specific parking area's detection"""
+    def generate():
+        detection_manager = get_detection_manager()
+        while True:
+            frame = detection_manager.get_frame(parking_id)
+            if frame is not None:
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            else:
+                # Send placeholder
+                placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(placeholder, f"Detection not running for area {parking_id}", (50, 240),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                ret, buffer = cv2.imencode('.jpg', placeholder)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.03)
+
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# ============================================================================
 # HEALTH CHECK
 # ============================================================================
 
@@ -1244,6 +1603,170 @@ def health_check():
             'status': 'unhealthy',
             'error': str(e)
         }), 500
+
+# ============================================================================
+# VIDEO UPLOAD AND PARKING AREA CREATION WIZARD
+# ============================================================================
+
+@app.route('/api/video/upload', methods=['POST'])
+def upload_video():
+    """Upload video file and extract reference frame for slot mapping"""
+    if 'video' not in request.files:
+        return jsonify({'error': 'No video file provided'}), 400
+
+    file = request.files['video']
+    if file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+
+    if not allowed_file(file.filename):
+        return jsonify({'error': 'Invalid file type. Allowed: mp4, avi, mov, mkv'}), 400
+
+    try:
+        # Save video
+        filename = secure_filename(file.filename)
+        timestamp = int(time.time())
+        video_filename = f"{timestamp}_{filename}"
+        video_path = os.path.join(UPLOAD_FOLDER, video_filename)
+        os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+        file.save(video_path)
+
+        # Extract reference frame
+        frame_filename = f"{timestamp}_frame.jpg"
+        frame_path = os.path.join(FRAME_FOLDER, frame_filename)
+        os.makedirs(FRAME_FOLDER, exist_ok=True)
+
+        cap = cv2.VideoCapture(video_path)
+        ret, frame = cap.read()
+        cap.release()
+
+        if not ret:
+            os.remove(video_path)  # Clean up
+            return jsonify({'error': 'Could not read video file'}), 400
+
+        cv2.imwrite(frame_path, frame)
+        height, width = frame.shape[:2]
+
+        return jsonify({
+            'video_path': video_path,
+            'frame_path': frame_path,
+            'frame_url': f'/api/frames/{frame_filename}',
+            'width': width,
+            'height': height,
+            'message': 'Video uploaded and frame extracted successfully'
+        }), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/frames/<filename>')
+def serve_frame(filename):
+    """Serve extracted frame image"""
+    return send_from_directory(FRAME_FOLDER, filename)
+
+
+@app.route('/api/parking-areas/create-with-slots', methods=['POST'])
+def create_parking_area_with_slots():
+    """Create parking area with slot polygons in one transaction"""
+    data = request.get_json()
+
+    # Required fields
+    parking_name = data.get('parking_name')
+    slots = data.get('slots', [])  # [{polygon_points: [[x,y],...], slot_number: 1}, ...]
+    boundary_polygon = data.get('boundary_polygon')  # [[lat,lng], ...]
+    video_source = data.get('video_source')
+    video_source_type = data.get('video_source_type', 'file')
+    reference_frame_path = data.get('reference_frame_path')
+
+    if not parking_name:
+        return jsonify({'error': 'parking_name is required'}), 400
+    if not slots:
+        return jsonify({'error': 'At least one slot is required'}), 400
+    if not boundary_polygon:
+        return jsonify({'error': 'boundary_polygon is required'}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        # Create parking area with geometry
+        cur.execute('''
+            INSERT INTO parking_area
+            (parking_name, slot_count, boundary_polygon, video_source, video_source_type, reference_frame_path)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING parking_id
+        ''', (parking_name, len(slots), json.dumps(boundary_polygon),
+              video_source, video_source_type, reference_frame_path))
+
+        parking_id = cur.fetchone()[0]
+
+        # Create slots with polygon geometry
+        for slot in slots:
+            cur.execute('''
+                INSERT INTO parking_slots (parking_id, slot_number, polygon_points)
+                VALUES (%s, %s, %s)
+            ''', (parking_id, slot['slot_number'], json.dumps(slot['polygon_points'])))
+
+        conn.commit()
+
+        # Auto-start detection if video source is provided
+        detection_started = False
+        if video_source:
+            try:
+                detection_manager = get_detection_manager()
+                result = detection_manager.start_detection(parking_id)
+                detection_started = result.get('status') == 'started'
+                if detection_started:
+                    print(f"✅ Auto-started detection for parking area {parking_id}")
+            except Exception as det_err:
+                print(f"⚠️ Could not auto-start detection: {det_err}")
+
+        return jsonify({
+            'id': parking_id,
+            'name': parking_name,
+            'total_slots': len(slots),
+            'detection_started': detection_started,
+            'message': 'Parking area created successfully with slot geometry'
+        }), 201
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/parking-areas/<int:parking_id>/slots-geometry', methods=['GET'])
+def get_slots_with_geometry(parking_id):
+    """Get parking slots with polygon geometry for CV processing"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute('''
+            SELECT slot_id, slot_number, polygon_points
+            FROM parking_slots
+            WHERE parking_id = %s
+            ORDER BY slot_number
+        ''', (parking_id,))
+
+        slots = []
+        for row in cur.fetchall():
+            slots.append({
+                'id': row[0],
+                'slot_number': row[1],
+                'polygon_points': row[2]  # Already JSON from DB
+            })
+
+        return jsonify(slots), 200
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        conn.close()
+
 
 # ============================================================================
 # VIOLATION DETECTION ENDPOINTS
@@ -1573,6 +2096,471 @@ def receive_violation_from_video():
         return jsonify({'error': str(e)}), 500
 
 
+# ============================================================================
+# CAMERA MANAGEMENT ENDPOINTS
+# ============================================================================
+
+# Global camera manager instance
+camera_manager = get_camera_manager()
+
+
+@app.route('/api/cameras', methods=['GET'])
+def get_cameras():
+    """GET - List all cameras with their status"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute('''
+            SELECT
+                c.camera_id,
+                c.camera_name,
+                c.rtsp_url,
+                c.parking_id,
+                pa.parking_name,
+                c.username IS NOT NULL as has_auth,
+                c.buffer_size,
+                c.timeout_seconds,
+                c.retry_interval_seconds,
+                c.max_retries,
+                c.is_active,
+                c.status as db_status,
+                c.last_connected_at,
+                c.created_at
+            FROM cameras c
+            LEFT JOIN parking_area pa ON c.parking_id = pa.parking_id
+            ORDER BY c.camera_id
+        ''')
+
+        cameras = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Get live status from camera manager
+        live_statuses = camera_manager.get_all_statuses()
+
+        result = []
+        for cam in cameras:
+            camera_id = cam[0]
+            live_info = live_statuses.get(camera_id, {})
+
+            result.append({
+                'camera_id': camera_id,
+                'camera_name': cam[1],
+                'rtsp_url': cam[2],
+                'parking_id': cam[3],
+                'parking_name': cam[4],
+                'has_auth': cam[5],
+                'buffer_size': cam[6],
+                'timeout_seconds': cam[7],
+                'retry_interval_seconds': cam[8],
+                'max_retries': cam[9],
+                'is_active': cam[10],
+                'db_status': cam[11],
+                'live_status': live_info.get('status', cam[11] or 'DISCONNECTED'),
+                'fps': live_info.get('fps', 0),
+                'last_connected_at': cam[12].isoformat() if cam[12] else None,
+                'created_at': cam[13].isoformat() if cam[13] else None
+            })
+
+        return jsonify(result), 200
+    except Exception as e:
+        print(f"Error fetching cameras: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/<int:camera_id>', methods=['GET'])
+def get_camera(camera_id):
+    """GET - Get a specific camera by ID"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute('''
+            SELECT
+                c.camera_id,
+                c.camera_name,
+                c.rtsp_url,
+                c.parking_id,
+                pa.parking_name,
+                c.username IS NOT NULL as has_auth,
+                c.buffer_size,
+                c.timeout_seconds,
+                c.retry_interval_seconds,
+                c.max_retries,
+                c.is_active,
+                c.status,
+                c.last_connected_at,
+                c.created_at
+            FROM cameras c
+            LEFT JOIN parking_area pa ON c.parking_id = pa.parking_id
+            WHERE c.camera_id = %s
+        ''', (camera_id,))
+
+        cam = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not cam:
+            return jsonify({'error': 'Camera not found'}), 404
+
+        # Get live status
+        health = camera_manager.get_camera_health(camera_id)
+
+        result = {
+            'camera_id': cam[0],
+            'camera_name': cam[1],
+            'rtsp_url': cam[2],
+            'parking_id': cam[3],
+            'parking_name': cam[4],
+            'has_auth': cam[5],
+            'buffer_size': cam[6],
+            'timeout_seconds': cam[7],
+            'retry_interval_seconds': cam[8],
+            'max_retries': cam[9],
+            'is_active': cam[10],
+            'db_status': cam[11],
+            'live_status': health.status.value if health else cam[11],
+            'fps': health.fps if health else 0,
+            'last_connected_at': cam[12].isoformat() if cam[12] else None,
+            'created_at': cam[13].isoformat() if cam[13] else None
+        }
+
+        return jsonify(result), 200
+    except Exception as e:
+        print(f"Error fetching camera {camera_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras', methods=['POST'])
+def create_camera():
+    """POST - Add a new camera"""
+    data = request.get_json()
+
+    camera_name = data.get('camera_name')
+    rtsp_url = data.get('rtsp_url')
+
+    if not camera_name or not rtsp_url:
+        return jsonify({'error': 'camera_name and rtsp_url are required'}), 400
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute('''
+            INSERT INTO cameras (
+                camera_name, rtsp_url, parking_id, username, password_encrypted,
+                buffer_size, timeout_seconds, retry_interval_seconds, max_retries, is_active
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING camera_id
+        ''', (
+            camera_name,
+            rtsp_url,
+            data.get('parking_id'),
+            data.get('username'),
+            data.get('password'),  # In production, encrypt this
+            data.get('buffer_size', 1),
+            data.get('timeout_seconds', 10),
+            data.get('retry_interval_seconds', 5),
+            data.get('max_retries', 3),
+            data.get('is_active', True)
+        ))
+
+        camera_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # Add to camera manager if active
+        if data.get('is_active', True):
+            config = CameraConfig(
+                camera_id=camera_id,
+                name=camera_name,
+                rtsp_url=rtsp_url,
+                parking_area_id=data.get('parking_id') or 0,
+                username=data.get('username'),
+                password=data.get('password'),
+                buffer_size=data.get('buffer_size', 1),
+                timeout_seconds=data.get('timeout_seconds', 10),
+                retry_interval_seconds=data.get('retry_interval_seconds', 5),
+                max_retries=data.get('max_retries', 3),
+                is_active=True
+            )
+            camera_manager.add_camera(config)
+
+        return jsonify({
+            'message': 'Camera created successfully',
+            'camera_id': camera_id
+        }), 201
+    except Exception as e:
+        print(f"Error creating camera: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/<int:camera_id>', methods=['PUT'])
+def update_camera(camera_id):
+    """PUT - Update a camera"""
+    data = request.get_json()
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Build dynamic update query
+        update_fields = []
+        params = []
+
+        field_mapping = {
+            'camera_name': 'camera_name',
+            'rtsp_url': 'rtsp_url',
+            'parking_id': 'parking_id',
+            'username': 'username',
+            'password': 'password_encrypted',
+            'buffer_size': 'buffer_size',
+            'timeout_seconds': 'timeout_seconds',
+            'retry_interval_seconds': 'retry_interval_seconds',
+            'max_retries': 'max_retries',
+            'is_active': 'is_active'
+        }
+
+        for key, db_field in field_mapping.items():
+            if key in data:
+                update_fields.append(f"{db_field} = %s")
+                params.append(data[key])
+
+        if not update_fields:
+            return jsonify({'error': 'No fields to update'}), 400
+
+        params.append(camera_id)
+        query = f"UPDATE cameras SET {', '.join(update_fields)} WHERE camera_id = %s"
+        cur.execute(query, params)
+
+        if cur.rowcount == 0:
+            return jsonify({'error': 'Camera not found'}), 404
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({'message': 'Camera updated successfully'}), 200
+    except Exception as e:
+        print(f"Error updating camera {camera_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/<int:camera_id>', methods=['DELETE'])
+def delete_camera(camera_id):
+    """DELETE - Delete a camera"""
+    try:
+        # Remove from camera manager first
+        camera_manager.remove_camera(camera_id)
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute('DELETE FROM cameras WHERE camera_id = %s', (camera_id,))
+
+        if cur.rowcount == 0:
+            return jsonify({'error': 'Camera not found'}), 404
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({'message': 'Camera deleted successfully'}), 200
+    except Exception as e:
+        print(f"Error deleting camera {camera_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/<int:camera_id>/connect', methods=['POST'])
+def connect_camera(camera_id):
+    """POST - Force connect a camera"""
+    try:
+        # Check if camera exists in database
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute('''
+            SELECT camera_id, camera_name, rtsp_url, parking_id, username, password_encrypted,
+                   buffer_size, timeout_seconds, retry_interval_seconds, max_retries
+            FROM cameras WHERE camera_id = %s
+        ''', (camera_id,))
+
+        cam = cur.fetchone()
+
+        if not cam:
+            cur.close()
+            conn.close()
+            return jsonify({'error': 'Camera not found'}), 404
+
+        # Add to manager if not exists
+        if not camera_manager.camera_exists(camera_id):
+            config = CameraConfig(
+                camera_id=cam[0],
+                name=cam[1],
+                rtsp_url=cam[2],
+                parking_area_id=cam[3] or 0,
+                username=cam[4],
+                password=cam[5],
+                buffer_size=cam[6],
+                timeout_seconds=cam[7],
+                retry_interval_seconds=cam[8],
+                max_retries=cam[9],
+                is_active=True
+            )
+            camera_manager.add_camera(config)
+        else:
+            camera_manager.connect_camera(camera_id)
+
+        # Update database status
+        cur.execute('''
+            UPDATE cameras SET status = 'CONNECTING', is_active = true
+            WHERE camera_id = %s
+        ''', (camera_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({'message': 'Camera connection initiated', 'camera_id': camera_id}), 200
+    except Exception as e:
+        print(f"Error connecting camera {camera_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/<int:camera_id>/disconnect', methods=['POST'])
+def disconnect_camera(camera_id):
+    """POST - Force disconnect a camera"""
+    try:
+        camera_manager.disconnect_camera(camera_id)
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            UPDATE cameras SET status = 'DISCONNECTED' WHERE camera_id = %s
+        ''', (camera_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({'message': 'Camera disconnected', 'camera_id': camera_id}), 200
+    except Exception as e:
+        print(f"Error disconnecting camera {camera_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/<int:camera_id>/health', methods=['GET'])
+def get_camera_health(camera_id):
+    """GET - Get health metrics for a specific camera"""
+    try:
+        health = camera_manager.get_camera_health(camera_id)
+
+        if not health:
+            return jsonify({'error': 'Camera not found or not active'}), 404
+
+        return jsonify({
+            'camera_id': camera_id,
+            'status': health.status.value,
+            'fps': round(health.fps, 1),
+            'frame_latency_ms': health.frame_latency_ms,
+            'last_frame_time': health.last_frame_time.isoformat() if health.last_frame_time else None,
+            'last_error': health.last_error,
+            'reconnect_count': health.reconnect_count,
+            'uptime_seconds': round(health.uptime_seconds, 1)
+        }), 200
+    except Exception as e:
+        print(f"Error getting camera health {camera_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/health-summary', methods=['GET'])
+def get_cameras_health_summary():
+    """GET - Get health summary for all cameras"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        cur.execute('''
+            SELECT
+                c.camera_id,
+                c.camera_name,
+                c.parking_id,
+                pa.parking_name,
+                c.is_active,
+                c.status as db_status
+            FROM cameras c
+            LEFT JOIN parking_area pa ON c.parking_id = pa.parking_id
+            ORDER BY c.camera_id
+        ''')
+
+        cameras = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Get live statuses
+        live_statuses = camera_manager.get_all_statuses()
+
+        # Count statuses
+        summary = {
+            'total': len(cameras),
+            'connected': 0,
+            'disconnected': 0,
+            'error': 0,
+            'reconnecting': 0,
+            'cameras': []
+        }
+
+        for cam in cameras:
+            camera_id = cam[0]
+            live_info = live_statuses.get(camera_id, {})
+            status = live_info.get('status', cam[5] or 'DISCONNECTED')
+
+            if status == 'CONNECTED':
+                summary['connected'] += 1
+            elif status == 'ERROR':
+                summary['error'] += 1
+            elif status in ('CONNECTING', 'RECONNECTING'):
+                summary['reconnecting'] += 1
+            else:
+                summary['disconnected'] += 1
+
+            summary['cameras'].append({
+                'camera_id': camera_id,
+                'camera_name': cam[1],
+                'parking_id': cam[2],
+                'parking_name': cam[3],
+                'is_active': cam[4],
+                'live_status': status,
+                'fps': live_info.get('fps', 0)
+            })
+
+        return jsonify(summary), 200
+    except Exception as e:
+        print(f"Error getting cameras health summary: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/cameras/<int:camera_id>/stream', methods=['GET'])
+def get_camera_stream(camera_id):
+    """GET - Get MJPEG stream from a specific camera"""
+    def generate_camera_frames(cam_id):
+        while True:
+            success, frame = camera_manager.get_camera_frame(cam_id)
+            if success and frame is not None:
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if ret:
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            time.sleep(0.033)  # ~30 FPS
+
+    if not camera_manager.camera_exists(camera_id):
+        return jsonify({'error': 'Camera not found or not active'}), 404
+
+    return Response(generate_camera_frames(camera_id),
+                   mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
 @app.route('/', methods=['GET'])
 def home():
     """API documentation"""
@@ -1605,6 +2593,18 @@ def home():
                 'POST /api/violations/check-duration': 'Check duration violations',
                 'POST /api/violations/resolve/<id>': 'Resolve a violation'
             },
+            'cameras': {
+                'GET /api/cameras': 'List all cameras with status',
+                'GET /api/cameras/<id>': 'Get specific camera',
+                'POST /api/cameras': 'Add new camera',
+                'PUT /api/cameras/<id>': 'Update camera',
+                'DELETE /api/cameras/<id>': 'Delete camera',
+                'POST /api/cameras/<id>/connect': 'Force connect camera',
+                'POST /api/cameras/<id>/disconnect': 'Force disconnect camera',
+                'GET /api/cameras/<id>/health': 'Get camera health metrics',
+                'GET /api/cameras/<id>/stream': 'Get MJPEG video stream',
+                'GET /api/cameras/health-summary': 'Get all cameras health overview'
+            },
             'stats': {
                 'GET /api/stats/overview': 'Overall statistics',
                 'GET /api/stats/hourly': 'Hourly statistics'
@@ -1613,7 +2613,14 @@ def home():
                 'GET /api/video-feed': 'Live video stream',
                 'POST /api/video/start': 'Start video processing',
                 'POST /api/video/stop': 'Stop video processing',
-                'GET /api/video/status': 'Video stream status'
+                'GET /api/video/status': 'Video stream status',
+                'POST /api/video/upload': 'Upload video and extract frame'
+            },
+            'wizard': {
+                'POST /api/video/upload': 'Upload video file for slot mapping',
+                'GET /api/frames/<filename>': 'Serve extracted frame image',
+                'POST /api/parking-areas/create-with-slots': 'Create parking area with slot polygons',
+                'GET /api/parking-areas/<id>/slots-geometry': 'Get slots with polygon geometry'
             },
             'health': {
                 'GET /api/health': 'Health check'
@@ -1623,13 +2630,13 @@ def home():
 
 if __name__ == '__main__':
     print("\n🚀 Starting Parking Management API Server...")
-    print("📍 Server: http://localhost:5000")
-    print("📖 Documentation: http://localhost:5000/\n")
+    print("📍 Server: http://localhost:5001")
+    print("📖 Documentation: http://localhost:5001/\n")
     print("📹 Receiving violations from video feed")
     print("   (Auto-checker disabled - using video detection)\n")
-    
+
     # Note: Auto-checker disabled when using video feed
     # Uncomment below to enable manual/database violation checking
     # start_violation_checker()
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+
+    app.run(host='0.0.0.0', port=5001, debug=True)

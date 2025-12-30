@@ -22,14 +22,17 @@ for path in [OUTPUT_PATH, SNAPSHOTS_PATH, LOGS_PATH, CONFIGS_PATH, MODELS_PATH]:
 # ============================================================================
 # YOLO MODEL CONFIGURATION
 # ============================================================================
-# Model Selection: yolov8n.pt (nano), yolov8s.pt (small), yolov8m.pt (medium), 
+# Model Selection: yolov8n.pt (nano), yolov8s.pt (small), yolov8m.pt (medium),
 #                  yolov8l.pt (large), yolov8x.pt (xlarge)
-YOLO_MODEL = "yolov8n.pt"  # Nano model - optimized for RTX 3050 multi-video (fast & low VRAM)
+YOLO_MODEL = "yolov8s.pt"  # Small model - 15-20% better accuracy, fits RTX 3050 (4GB VRAM)
 
 # YOLO Detection Parameters
-CONFIDENCE_THRESHOLD = 0.25        # Minimum confidence for detections (lowered for immediate detection)
-IOU_THRESHOLD = 0.65               # Non-Maximum Suppression threshold (balanced)
-IMAGE_SIZE = 640                   # Optimized for RTX 3050 (640 = fast, 960 = accurate but slower)
+CONFIDENCE_THRESHOLD = 0.35        # Minimum confidence for detections (increased to reduce false positives)
+IOU_THRESHOLD = 0.50               # Non-Maximum Suppression threshold (improved for overlapping vehicles)
+IMAGE_SIZE = 960                   # Higher resolution for better accuracy (use 640 for multi-camera)
+
+# Minimum vehicle detection area (filters out noise/small objects)
+MIN_VEHICLE_AREA = 3000            # Minimum bounding box area in pixels
 
 # Vehicle Classes (COCO dataset class IDs)
 VEHICLE_CLASSES = {
@@ -132,6 +135,39 @@ VERBOSE = False                # YOLO verbose output
 # ============================================================================
 # PERFORMANCE OPTIMIZATION - RTX 3050 (4GB VRAM)
 # ============================================================================
-USE_GPU = True                 # Use GPU if available (CUDA) - ✅ ENABLED
+# Allow forcing CPU-only mode via environment variable
+# Set FORCE_CPU=true to disable GPU even if available (useful for Docker/testing)
+FORCE_CPU = os.environ.get('FORCE_CPU', 'false').lower() == 'true'
+USE_GPU = not FORCE_CPU        # Use GPU if available (CUDA) and not forced to CPU
 HALF_PRECISION = True          # Use FP16 for 2x speed boost on RTX 3050 - ✅ RECOMMENDED
 MAX_DET = 300                  # Maximum number of detections per image
+
+# ============================================================================
+# RTSP CAMERA SETTINGS
+# ============================================================================
+RTSP_BUFFER_SIZE = 1           # Buffer size for RTSP streams (1 = minimal latency)
+RTSP_TIMEOUT = 10              # Connection timeout in seconds
+RTSP_RECONNECT_INTERVAL = 5    # Base interval between reconnection attempts (seconds)
+RTSP_MAX_RETRIES = 3           # Maximum reconnection attempts before giving up
+RTSP_HEALTH_CHECK_INTERVAL = 30  # Interval for health monitoring (seconds)
+RTSP_USE_TCP = True            # Use TCP transport (more reliable than UDP)
+
+# Multi-camera settings
+MAX_CAMERAS = 3                # Maximum simultaneous cameras on RTX 3050
+MULTI_CAMERA_IMAGE_SIZE = 640  # Use lower resolution when running multiple cameras
+DETECTION_SKIP_FRAMES = 2      # Process every Nth frame in multi-camera mode
+
+# ============================================================================
+# SLOT OCCUPANCY DETECTION
+# ============================================================================
+# Class-based overlap weights for different vehicle types
+VEHICLE_CLASS_WEIGHTS = {
+    2: 1.0,    # car - standard threshold
+    3: 0.5,    # motorcycle - lower requirement (smaller vehicle)
+    5: 1.2,    # bus - higher requirement (larger vehicle)
+    7: 1.1     # truck - slightly higher requirement
+}
+
+# Center point bonus for occupancy detection
+CENTER_POINT_BONUS = 0.2       # Bonus if vehicle center is inside slot polygon
+DEFAULT_OVERLAP_THRESHOLD = 0.20  # Minimum overlap to consider vehicle in slot

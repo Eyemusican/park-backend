@@ -25,6 +25,9 @@ from parking_duration_tracker import ParkingDurationTracker
 from violation_detector import ViolationDetector
 from vehicle_analyzer import get_analyzer
 import requests
+import psycopg2
+from dotenv import load_dotenv
+load_dotenv()
 
 
 # ============================================================================
@@ -33,6 +36,64 @@ import requests
 
 # Default video file (used when running: python smart_parking_mvp.py)
 DEFAULT_VIDEO_FILE = 'parking_evening_vedio.mp4'
+
+
+# ============================================================================
+# DATABASE SLOT LOADER
+# ============================================================================
+
+def load_slots_from_database(parking_id=None):
+    """
+    Load parking slot polygons from database.
+    Returns list of dicts with 'id' and 'points' keys.
+    """
+    try:
+        conn = psycopg2.connect(
+            host=os.environ.get('DB_HOST', 'localhost'),
+            port=os.environ.get('DB_PORT', '5432'),
+            dbname=os.environ.get('DB_NAME', 'parking_db'),
+            user=os.environ.get('DB_USER', 'parking_user'),
+            password=os.environ.get('DB_PASS', '')
+        )
+        cur = conn.cursor()
+
+        if parking_id:
+            cur.execute('''
+                SELECT slot_id, slot_number, polygon_points
+                FROM parking_slots
+                WHERE parking_id = %s AND polygon_points IS NOT NULL
+                ORDER BY slot_number
+            ''', (parking_id,))
+        else:
+            # Load all slots with geometry (for backwards compatibility)
+            cur.execute('''
+                SELECT slot_id, slot_number, polygon_points
+                FROM parking_slots
+                WHERE polygon_points IS NOT NULL
+                ORDER BY slot_id
+            ''')
+
+        slots = []
+        for row in cur.fetchall():
+            slot_id, slot_number, polygon_points = row
+            if polygon_points:
+                # Handle both string and dict from JSONB
+                if isinstance(polygon_points, str):
+                    polygon_points = json.loads(polygon_points)
+                slots.append({
+                    'id': slot_number,  # Use slot_number as ID for display
+                    'name': f'Slot-{slot_number}',
+                    'points': polygon_points
+                })
+
+        cur.close()
+        conn.close()
+
+        return slots if slots else None
+
+    except Exception as e:
+        print(f"⚠️ Database connection failed: {e}")
+        return None
 
 
 # ============================================================================
@@ -106,7 +167,57 @@ class ParkingSlot:
         else:
             threshold = 0.50  # All others: 50%
         return overlap >= threshold
-    
+
+    def check_overlap_enhanced(self, bbox, vehicle_class=2):
+        """
+        Enhanced overlap detection with vehicle class weights and center point bonus.
+
+        Args:
+            bbox: Bounding box (x1, y1, x2, y2)
+            vehicle_class: COCO class ID (2=car, 3=motorcycle, 5=bus, 7=truck)
+
+        Returns:
+            float: Overlap score (0.0 to 1.0+) with class weighting and center bonus
+        """
+        from shapely.geometry import Point
+
+        x1, y1, x2, y2 = bbox
+        vehicle_box = shapely_box(x1, y1, x2, y2)
+
+        if not self.polygon.intersects(vehicle_box):
+            return 0.0
+
+        intersection = self.polygon.intersection(vehicle_box).area
+        slot_area = self.polygon.area
+
+        if slot_area <= 0:
+            return 0.0
+
+        # Base overlap ratio
+        base_overlap = intersection / slot_area
+
+        # Class-based threshold adjustment
+        # Smaller vehicles (motorcycles) need less overlap to be considered "in" the slot
+        # Larger vehicles (buses, trucks) need more overlap
+        class_weights = {
+            2: 1.0,    # car - standard threshold
+            3: 0.5,    # motorcycle - lower requirement (smaller vehicle)
+            5: 1.2,    # bus - higher requirement (larger vehicle)
+            7: 1.1     # truck - slightly higher requirement
+        }
+        weight = class_weights.get(vehicle_class, 1.0)
+
+        # Center point bonus: +20% if vehicle center is inside slot polygon
+        center_x = (x1 + x2) // 2
+        center_y = (y1 + y2) // 2
+        center_point = Point(center_x, center_y)
+        center_bonus = 0.2 if self.polygon.contains(center_point) else 0.0
+
+        # Combined score with class weighting and center bonus
+        overlap_score = (base_overlap * weight) + center_bonus
+
+        return min(overlap_score, 1.0)  # Cap at 1.0
+
     def lock_vehicle_id(self, vehicle_id, bbox, vehicle_details=None):
         """Lock a vehicle ID to this slot - ID will NEVER change until vehicle exits"""
         # Always reset timer for new vehicle (fresh parking session)
@@ -173,11 +284,19 @@ class SmartParkingMVP:
     Focused on: detection, occupancy, duration, visualization
     """
     
-    def __init__(self, slots_json, model_path='yolov8s.pt'):  # Use SMALL model for better accuracy
+    def __init__(self, slots_json=None, model_path='yolov8s.pt', parking_id=None):
+        """
+        Initialize Smart Parking MVP.
+
+        Args:
+            slots_json: Path to JSON file with slot definitions (fallback)
+            model_path: Path to YOLO model
+            parking_id: Database parking_id to load slots from (preferred)
+        """
         print("="*70)
         print("SMART PARKING SYSTEM MVP - GovTech PoC")
         print("="*70)
-        
+
         # GPU check
         if torch.cuda.is_available():
             self.device = 'cuda'
@@ -187,21 +306,45 @@ class SmartParkingMVP:
         else:
             self.device = 'cpu'
             print("⚠️  Running on CPU (slower)")
-        
+
         # Load YOLO
         print(f"\nLoading YOLO model: {model_path}")
         self.model = YOLO(model_path)
         if self.device == 'cuda':
             self.model.to('cuda')
         print("✅ Model loaded")
-        
-        # Load parking slots
-        print(f"\nLoading slots: {slots_json}")
-        with open(slots_json, 'r') as f:
-            data = json.load(f)
-        
-        self.slots = [ParkingSlot(s['id'], s['points']) for s in data['slots']]
-        print(f"✅ Loaded {len(self.slots)} parking slots")
+
+        # Load parking slots - try database first, then JSON fallback
+        slots_data = None
+
+        if parking_id:
+            print(f"\nLoading slots from database (parking_id={parking_id})...")
+            slots_data = load_slots_from_database(parking_id)
+            if slots_data:
+                print(f"✅ Loaded {len(slots_data)} slots from database")
+            else:
+                print("⚠️  No slots found in database for this parking area")
+
+        if not slots_data:
+            # Try loading all slots from database (any with geometry)
+            print("\nChecking database for any slots with geometry...")
+            slots_data = load_slots_from_database()
+            if slots_data:
+                print(f"✅ Loaded {len(slots_data)} slots from database")
+
+        if not slots_data and slots_json and os.path.exists(slots_json):
+            # Fallback to JSON file
+            print(f"\nFallback: Loading slots from JSON: {slots_json}")
+            with open(slots_json, 'r') as f:
+                data = json.load(f)
+            slots_data = data.get('slots', [])
+            print(f"✅ Loaded {len(slots_data)} slots from JSON")
+
+        if not slots_data:
+            raise ValueError("No parking slots found! Create slots via web UI or provide slots JSON file.")
+
+        self.slots = [ParkingSlot(s['id'], s['points']) for s in slots_data]
+        print(f"\n✅ Total parking slots loaded: {len(self.slots)}")
         
         # Initialize Duration Tracker
         print("\n🕒 Initializing Duration Tracker...")
@@ -1189,79 +1332,85 @@ def map_parking_slots(video_path, output_json='configs/parking_slots.json'):
 
 def main():
     """Main entry point"""
-    # Default to running DEFAULT_VIDEO_FILE if no arguments
-    if len(sys.argv) < 2:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='SMART PARKING SYSTEM MVP - GovTech PoC',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Map parking slots interactively
+  python smart_parking_mvp.py --map parking.mp4
+
+  # Run detection with JSON slot config
+  python smart_parking_mvp.py --run parking.mp4
+
+  # Run detection with slots from database (parking area ID)
+  python smart_parking_mvp.py --run parking.mp4 --parking-id 1
+
+  # Run with default video
+  python smart_parking_mvp.py
+        """
+    )
+
+    parser.add_argument('--map', metavar='VIDEO', help='Map parking slots interactively')
+    parser.add_argument('--run', metavar='VIDEO', help='Run parking detection on video')
+    parser.add_argument('--parking-id', type=int, metavar='ID',
+                        help='Load slots from database for this parking area ID')
+    parser.add_argument('--output', '-o', metavar='VIDEO', help='Output video file (optional)')
+    parser.add_argument('--slots', metavar='JSON', default='configs/parking_slots.json',
+                        help='Slots JSON file (default: configs/parking_slots.json)')
+
+    args = parser.parse_args()
+
+    # If no arguments, run with default video
+    if not args.map and not args.run:
         video_file = DEFAULT_VIDEO_FILE
         if not os.path.exists(video_file):
-            print("="*70)
-            print("SMART PARKING SYSTEM MVP - GovTech PoC")
-            print("="*70)
-            print("\nUsage:")
-            print("  1. Define parking slots:")
-            print("     python smart_parking_mvp.py --map <video_file>")
-            print("\n  2. Run parking detection:")
-            print("     python smart_parking_mvp.py --run <video_file>")
-            print("\n  3. Run with default video:")
-            print("     python smart_parking_mvp.py")
-            print("\nExample:")
-            print("  python smart_parking_mvp.py --map parking.mp4")
-            print("  python smart_parking_mvp.py --run parking.mp4")
-            print("="*70)
+            parser.print_help()
             return
-        
-        # Run with default video
-        slots_json = 'configs/parking_slots.json'
-        if not os.path.exists(slots_json):
-            print(f"[ERROR] Slots not found: {slots_json}")
-            print("Run --map first to define parking slots")
-            return
-        
-        system = SmartParkingMVP(slots_json)
+
+        # Run with default video - try database first
+        if args.parking_id:
+            system = SmartParkingMVP(parking_id=args.parking_id)
+        else:
+            slots_json = args.slots
+            if not os.path.exists(slots_json):
+                print(f"[ERROR] Slots not found: {slots_json}")
+                print("Run --map first to define parking slots, or use --parking-id")
+                return
+            system = SmartParkingMVP(slots_json=slots_json)
+
         system.run(video_file)
         return
-    
-    mode = sys.argv[1]
-    
-    if mode == '--map':
-        # Slot mapping mode
-        if len(sys.argv) < 3:
-            print("[ERROR] Video file required")
+
+    # Slot mapping mode
+    if args.map:
+        if not os.path.exists(args.map):
+            print(f"[ERROR] Video not found: {args.map}")
             return
-        
-        video_file = sys.argv[2]
-        if not os.path.exists(video_file):
-            print(f"[ERROR] Video not found: {video_file}")
+        map_parking_slots(args.map)
+        return
+
+    # Detection mode
+    if args.run:
+        if not os.path.exists(args.run):
+            print(f"[ERROR] Video not found: {args.run}")
             return
-        
-        map_parking_slots(video_file)
-    
-    elif mode == '--run':
-        # Detection mode
-        if len(sys.argv) < 3:
-            print("[ERROR] Video file required")
-            return
-        
-        video_file = sys.argv[2]
-        if not os.path.exists(video_file):
-            print(f"[ERROR] Video not found: {video_file}")
-            return
-        
-        slots_json = 'configs/parking_slots.json'
-        if not os.path.exists(slots_json):
-            print(f"[ERROR] Slots not found: {slots_json}")
-            print("Run --map first to define parking slots")
-            return
-        
-        # Optional output video
-        output_video = sys.argv[3] if len(sys.argv) > 3 else None
-        
-        # Run system
-        system = SmartParkingMVP(slots_json)
-        system.run(video_file, output_video)
-    
-    else:
-        print(f"[ERROR] Unknown mode: {mode}")
-        print("Use --map or --run")
+
+        # Load slots from database (preferred) or JSON (fallback)
+        if args.parking_id:
+            print(f"📊 Loading slots from database (parking_id={args.parking_id})")
+            system = SmartParkingMVP(parking_id=args.parking_id)
+        else:
+            slots_json = args.slots
+            if not os.path.exists(slots_json):
+                print(f"[ERROR] Slots not found: {slots_json}")
+                print("Run --map first to define parking slots, or use --parking-id")
+                return
+            system = SmartParkingMVP(slots_json=slots_json)
+
+        system.run(args.run, args.output)
 
 
 if __name__ == "__main__":

@@ -25,3 +25,17 @@ requests>=2.31.0
 # License Plate Recognition & Vehicle Analysis
 easyocr>=1.7.0
 imutils>=0.5.4
+
+# Web framework
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Database
+psycopg2-binary>=2.9.0
+
+# Environment
+python-dotenv>=1.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
